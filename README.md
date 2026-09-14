@@ -27,10 +27,10 @@ Three boundaries, each with a single responsibility:
   `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
   is swappable without touching the chat layer.
 - **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
-  embeddable, storable units: extraction (`DocumentExtractor`), chunking (`DocumentChunker`),
-  embedding (`EmbeddingProvider`), and vector storage (`VectorStore`), each behind its own
-  Protocol. Framework-independent: it doesn't import FastAPI and isn't wired into any
-  endpoint yet.
+  embeddable, storable, and now searchable units: extraction (`DocumentExtractor`), chunking
+  (`DocumentChunker`), embedding (`EmbeddingProvider`), vector storage (`VectorStore`), and
+  semantic retrieval (`Retriever`), each behind its own Protocol. Framework-independent: it
+  doesn't import FastAPI and isn't wired into any endpoint yet.
 
 ## Current implementation status
 
@@ -48,12 +48,14 @@ Three boundaries, each with a single responsibility:
 - Section-aware document chunking
 - `EmbeddingProvider` Protocol, with fake and OpenAI implementations
 - `VectorStore` Protocol, with in-memory and PostgreSQL+pgvector implementations
+- `Retriever` Protocol, with a `VectorRetriever` implementation (semantic retrieval: query →
+  embedding → vector search → ranked chunks)
 - Unit/integration tests
 
 **Not implemented yet:**
 - Document ingestion pipeline/endpoint (the stages above aren't wired together yet)
-- Retrieval
-- RAG
+- RAG (LLM answer generation grounded in retrieved chunks)
+- `ChatService` integration with retrieval
 - Car-rental tools
 - Agent/tool orchestration
 - Conversation persistence
@@ -67,7 +69,7 @@ app/
 ├── chats/           # Chat feature: router, schemas, ChatService
 ├── core/             # Cross-cutting config (Settings)
 ├── health/           # Health-check endpoint
-├── knowledge/         # Document contracts, extraction, chunking, embedding, vector storage
+├── knowledge/         # Document contracts, extraction, chunking, embedding, storage, retrieval
 └── llm/               # LLMProvider Protocol + fake/OpenAI implementations
 
 tests/                # Mirrors the app/ layout, one test package per feature
@@ -78,8 +80,8 @@ docker-compose.yml     # Local PostgreSQL + pgvector, for VECTOR_STORE_PROVIDER=
 
 ## Knowledge pipeline
 
-**Current** (each stage implemented and tested; not yet wired together into one ingestion
-flow — there is no ingestion endpoint or script that runs all of them in sequence):
+**Current — ingestion** (each stage implemented and tested; not yet wired together into one
+ingestion flow — there is no ingestion endpoint or script that runs all of them in sequence):
 ```
 PDF
   ↓
@@ -100,14 +102,29 @@ VectorStore
 persisted, searchable chunks
 ```
 
+**Current — retrieval** (implemented and tested; not yet reachable via any endpoint):
+```
+user query
+  ↓
+Retriever
+  ↓
+EmbeddingProvider  →  query embedding
+  ↓
+VectorStore.search()
+  ↓
+ranked VectorSearchResult[]
+```
+
 **Planned:**
 ```
-persisted, searchable chunks
+ranked VectorSearchResult[]
   ↓
-Retrieval
-  ↓
-LLM
+RAG (prompt construction + LLM)
 ```
+
+Retrieval finds relevant chunks; it does not yet generate an answer. Turning retrieved chunks
+into an LLM-generated reply (RAG), wiring this into `ChatService`, tools, agent orchestration,
+and conversation memory are all still future work.
 
 The two PDFs in `data/knowledge/` (`car-rental-services.pdf`, `car-rental-policies.pdf`) are
 the initial car-rental knowledge sources this pipeline will eventually be built around.
@@ -164,6 +181,9 @@ OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
 VECTOR_STORE_PROVIDER=memory         # "memory" or "pgvector"
 DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive  # only for pgvector
+
+RETRIEVAL_TOP_K=5                    # default VectorRetriever.retrieve() top_k
+# RETRIEVAL_MIN_SCORE=0.75           # unset by default - see Retrieval section below
 ```
 
 `.env` is gitignored and must never be committed — only `.env.example`, with placeholder
@@ -180,9 +200,11 @@ abstraction (fake, OpenAI with a mocked SDK client, and provider-selection/confi
 behavior), the knowledge-document contracts, the PDF extractor (including an integration check
 against the real PDFs in `data/knowledge/`), section-aware chunking (including chunk
 statistics against the real PDFs), the embedding provider abstraction (fake, and OpenAI with a
-mocked SDK client), and the vector store abstraction (in-memory unit tests plus
-provider-selection/config-failure behavior). All of the above run without any external network
-access, API key, or database.
+mocked SDK client), the vector store abstraction (in-memory unit tests plus
+provider-selection/config-failure behavior), and the retrieval layer (orchestration tests with
+stub providers/stores, plus a deterministic end-to-end test using the real
+`FakeEmbeddingProvider` + `InMemoryVectorStore`). All of the above run without any external
+network access, API key, or database.
 
 A separate `tests/knowledge/test_pgvector_store_integration.py` exercises `PgVectorStore`
 against a real PostgreSQL+pgvector instance; it's skipped automatically unless `DATABASE_URL`
@@ -293,6 +315,44 @@ needs to fetch or mutate one stored chunk in isolation yet.
 extension and this store's table - it's an explicit call, not run automatically on app start.
 The default `VECTOR_STORE_PROVIDER=memory` needs no database at all.
 
+## Retrieval
+
+```
+query text
+  ↓
+Retriever (Protocol)
+  ↑
+VectorRetriever
+  ├── EmbeddingProvider  (embeds the query)
+  └── VectorStore        (finds the most similar stored chunks)
+```
+
+- `Retriever` (`app/knowledge/retriever.py`) depends only on the `EmbeddingProvider` and
+  `VectorStore` Protocols — never a concrete OpenAI/pgvector type, and never FastAPI.
+  `VectorRetriever` is pure orchestration: it embeds the query, calls `VectorStore.search()`,
+  and returns the results. Query-embedding logic stays out of `VectorStore`; ranking/search
+  logic stays out of `EmbeddingProvider`.
+- **top_k** has one source of truth: `Settings.retrieval_top_k` (default `5`), read once by
+  `get_retriever()` into `VectorRetriever`'s `default_top_k`, overridable per call
+  (`retrieve(query, top_k=...)`). `VectorStore`'s own `top_k=5` default is never relied on -
+  `VectorRetriever` always passes an explicit value. Results are never padded to reach top_k:
+  if the store has fewer matches, fewer are returned, exactly as `VectorStore.search()` says.
+- **Similarity threshold (`min_score`)** exists as a parameter and a `Settings.retrieval_min_score`
+  setting but is **disabled by default** (`None`). There is no empirical basis yet for a
+  universal cosine-similarity cutoff for this embedding model/knowledge base — no labeled
+  queries, no evaluation loop (that's the roadmap's still-future "Conversation/Q&A evaluation
+  loop"), and the default `FakeEmbeddingProvider`'s hash-derived vectors aren't semantically
+  meaningful anyway, so there's nothing to calibrate a default against honestly. The filtering
+  itself is implemented and tested; a real value can be set later via `RETRIEVAL_MIN_SCORE`
+  once there's data to justify one, with no code change.
+- Errors are not re-wrapped: `EmbeddingProviderError`/`VectorStoreError` propagate through
+  `Retriever` unchanged — it calls no raw SDK itself, only Protocols that already translate
+  their own failures.
+- `get_retriever(settings)` is a plain function, not FastAPI `Depends()`-wired, for the same
+  reason as `get_embedding_provider()`/`get_vector_store()`: there is still no retrieval
+  endpoint. It composes its own `EmbeddingProvider`/`VectorStore` via their existing
+  composition points rather than deciding providers itself.
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -303,8 +363,8 @@ The default `VECTOR_STORE_PROVIDER=memory` needs no database at all.
 - [x] Document chunking
 - [x] Embedding provider
 - [x] Vector store foundation
+- [x] Semantic retrieval
 - [ ] Document ingestion pipeline
-- [ ] Retrieval
 - [ ] RAG
 - [ ] Car-rental tools
 - [ ] Agent orchestration

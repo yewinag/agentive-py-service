@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     # postgresql+asyncpg://user:password@host:5432/dbname
     database_url: Optional[str] = None
 
+    # Default VectorRetriever.retrieve() top_k, overridable per call.
+    retrieval_top_k: int = 5
+
+    # No default on purpose (None = no filtering): there is no empirical
+    # basis yet for a universal similarity cutoff for a given embedding
+    # model/knowledge base. See README's Retrieval section.
+    retrieval_min_score: Optional[float] = None
+
 
 @lru_cache
 def get_settings() -> Settings:
