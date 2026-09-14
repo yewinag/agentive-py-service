@@ -13,23 +13,28 @@ Frontend
 Main Business API
   ↓
 FastAPI Agentive Service
-  ├── Chat              (app/chats)
-  ├── RAG / Answering    (app/rag)
-  ├── LLM Provider        (app/llm)
-  └── Knowledge Pipeline   (app/knowledge)
+  ├── Chat                  (app/chats)
+  ├── Conversation Memory     (app/conversation)
+  ├── RAG / Answering          (app/rag)
+  ├── LLM Provider               (app/llm)
+  └── Knowledge Pipeline           (app/knowledge)
 ```
 
-Four boundaries, each with a single responsibility:
+Five boundaries, each with a single responsibility:
 
 - **Chat/application layer** (`app/chats`) — orchestrates one HTTP request: validates input,
-  delegates to `AnswerGenerator` via `ChatService`, shapes the response. `POST /api/v1/chat`
-  now returns a knowledge-grounded answer (see Chat API integration section below).
-- **RAG / grounded-answering layer** (`app/rag`) — combines retrieval and LLM generation into
-  one grounded answer, behind `AnswerGenerator`. Depends on the `Retriever` and `LLMProvider`
-  Protocols only. `ChatService` is its one real consumer.
+  resolves/continues a conversation, delegates to `AnswerGenerator` via `ChatService`, shapes
+  the response. `POST /api/v1/chat` returns a knowledge-grounded, multi-turn-aware answer.
+- **Conversation memory layer** (`app/conversation`) — a domain deliberately separate from the
+  knowledge base (see Conversation context section below): identity, ordering, and bounded
+  recent-history for a conversation, behind `ConversationStore`. Holds no car-rental knowledge,
+  no embeddings, no vectors.
+- **RAG / grounded-answering layer** (`app/rag`) — combines retrieval, bounded conversation
+  context, and LLM generation into one grounded answer, behind `AnswerGenerator`. Depends on
+  the `Retriever` and `LLMProvider` Protocols only. `ChatService` is its one real consumer.
 - **LLM provider layer** (`app/llm`) — answers "how do we generate a reply?" behind an
   `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
-  is swappable without touching the chat or RAG layers.
+  is swappable without touching the chat, conversation, or RAG layers.
 - **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
   embeddable, storable, and searchable units: extraction (`DocumentExtractor`), chunking
   (`DocumentChunker`), embedding (`EmbeddingProvider`), vector storage (`VectorStore`),
@@ -63,10 +68,17 @@ Four boundaries, each with a single responsibility:
 - Startup bootstrap of the two committed PDFs into the default in-memory knowledge store
 - A clean, generic 503 response for embedding/vector-store/LLM failures (no raw SDK/database
   error ever reaches the client)
+- `ConversationStore` Protocol, with an in-memory implementation (`Conversation`,
+  `ConversationMessage`: identity, ordering, bounded recent-history - kept a separate domain
+  from the knowledge base, never stored in the vector store)
+- Multi-turn conversations over `POST /api/v1/chat`: an optional `conversation_id` in the
+  request, echoed in the response, carrying a bounded recent-message window into the prompt
 - Unit/integration tests
 
 **Not implemented yet:**
-- Conversation memory / chat history persistence
+- Conversation persistence beyond a single process (no PostgreSQL-backed `ConversationStore`
+  yet - see Conversation context section for why)
+- Long-term/semantic conversation memory, summarization, or query rewriting for follow-ups
 - Car-rental tools / function calling
 - Agent orchestration / autonomous planning
 - Q&A evaluation/improvement loop
@@ -79,13 +91,14 @@ Four boundaries, each with a single responsibility:
 ```
 app/
 ├── api/            # Router aggregation + shared exception handlers
-├── chats/           # Chat feature: router, schemas, ChatService (-> AnswerGenerator)
+├── chats/           # Chat feature: router, schemas, ChatService (-> AnswerGenerator + ConversationStore)
+├── conversation/     # Conversation, ConversationMessage, ConversationStore Protocol + in-memory impl
 ├── core/             # Cross-cutting config (Settings)
 ├── health/           # Health-check endpoint
 ├── knowledge/         # Document contracts, extraction, chunking, embedding, storage,
 │                       # retrieval, ingestion orchestration, and startup bootstrap
 ├── llm/               # LLMProvider Protocol + fake/OpenAI implementations
-└── rag/                # AnswerGenerator: Retriever + LLMProvider -> grounded answer
+└── rag/                # AnswerGenerator: Retriever + LLMProvider + history -> grounded answer
 
 tests/                # Mirrors the app/ layout, one test package per feature
 data/
@@ -109,23 +122,26 @@ EmbeddingProvider       →  embedding vector[]
 VectorStore              →  persisted, searchable chunks
 ```
 
-**Retrieval + RAG, now reachable via `POST /api/v1/chat`:**
+**Retrieval + RAG + conversation context, reachable via `POST /api/v1/chat`:**
 ```
-user message
+user message + optional conversation_id
   ↓
-ChatService
+ChatService  →  ConversationStore  (resolve conversation, load bounded recent history)
   ↓
 AnswerGenerator  →  Retriever  →  EmbeddingProvider  →  VectorStore.search()
   ↓                                      ↓
 LLMProvider.generate_reply()   ranked VectorSearchResult[]
+  (prompt = grounding + history + knowledge context + question)
   ↓
-ChatResponse { reply, sources[] }
+ChatService  →  ConversationStore  (append user + assistant messages)
+  ↓
+ChatResponse { reply, sources[], conversation_id }
 ```
 
-Every stage is implemented, tested, and now wired end to end. Ingestion still has no HTTP
+Every stage is implemented, tested, and wired end to end. Ingestion still has no HTTP
 trigger - the default in-memory store is populated by an explicit startup bootstrap instead
-(see Chat API integration below). Tools, agent orchestration, and conversation memory remain
-future work.
+(see Chat API integration below). Tools, agent orchestration, conversation summarization, and
+durable (cross-process) conversation persistence remain future work.
 
 The two PDFs in `data/knowledge/` (`car-rental-services.pdf`, `car-rental-policies.pdf`) are
 the car-rental knowledge sources this pipeline is built, tested, and (by default) bootstrapped
@@ -159,8 +175,9 @@ fastapi dev app/main.py
 Available endpoints:
 - `GET /health` — service health check
 - `GET /docs` — interactive Swagger UI
-- `POST /api/v1/chat` — returns a knowledge-grounded answer, by default drawn from the two
-  PDFs bootstrapped into the in-memory store at startup (see Chat API integration below)
+- `POST /api/v1/chat` — returns a knowledge-grounded, multi-turn-aware answer, by default drawn
+  from the two PDFs bootstrapped into the in-memory store at startup (see Chat API integration
+  and Conversation context below)
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/chat \
@@ -172,8 +189,16 @@ curl -X POST http://127.0.0.1:8000/api/v1/chat \
   "reply": "...",
   "sources": [
     {"document_title": "Terms & Rental Policies", "section_heading": "1. Driver Eligibility & Required Documents"}
-  ]
+  ],
+  "conversation_id": "6a0fa43e630b4c418d63e9735dbfe4ea"
 }
+```
+
+Continue the same conversation by passing `conversation_id` back on the next request:
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"And what documents do I need?","conversation_id":"6a0fa43e630b4c418d63e9735dbfe4ea"}'
 ```
 
 With the default configuration (`LLM_PROVIDER=fake`, `EMBEDDING_PROVIDER=fake`), `reply` is a
@@ -203,16 +228,23 @@ DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive  # o
 
 RETRIEVAL_TOP_K=5                    # default VectorRetriever.retrieve() top_k
 # RETRIEVAL_MIN_SCORE=0.75           # unset by default - see Retrieval section below
+
+CONVERSATION_STORE_PROVIDER=memory   # only "memory" is implemented today
+CONVERSATION_HISTORY_WINDOW=6        # last N messages (~3 turns) sent to the LLM as context
 ```
 
 `.env` is gitignored and must never be committed — only `.env.example`, with placeholder
 values, is tracked.
 
-No new settings were needed for ingestion, RAG, or wiring chat to RAG: all of it reuses
-`embedding_provider`, `vector_store_provider`, `llm_provider`, and
-`retrieval_top_k`/`retrieval_min_score` as-is. The grounding system prompt is a fixed code
-constant, not a setting - it's not something that should vary by environment, and making it
-configurable would just be a place for inconsistent/untested prompt variants to creep in.
+Ingestion and wiring chat to RAG needed no new settings. Step 13 adds exactly two, both
+following existing patterns: `conversation_store_provider` (matches `vector_store_provider`'s
+shape, even with only one working value today - see Conversation context) and
+`conversation_history_window` (an operational tuning knob, matching `retrieval_top_k`'s
+precedent - a bounded window is safe to default without usage data, unlike a similarity
+threshold, which could silently under- or over-filter in either direction if guessed). The
+grounding system prompt remains a fixed code constant, not a setting - it's not something that
+should vary by environment, and making it configurable would just be a place for
+inconsistent/untested prompt variants to creep in.
 
 ## Testing
 
@@ -237,10 +269,21 @@ called directly - no FastAPI/lifespan involved), and the wired `/api/v1/chat` en
 router-level tests (stubbed `ChatService`, proving the router only depends on
 `get_chat_service()`'s abstraction), a full HTTP round-trip test chaining
 `FakeDocumentExtractor → SectionAwareChunker → FakeEmbeddingProvider → InMemoryVectorStore →
-Retriever → FakeLLMProvider → AnswerGenerator → ChatService →` the real FastAPI app, and a
-parametrized test confirming embedding/vector-store/LLM failures all return a clean 503 with no
-provider-specific detail in the body. All of the above run without any external network access,
-API key, or database.
+Retriever → FakeLLMProvider → AnswerGenerator → InMemoryConversationStore → ChatService →` the
+real FastAPI app - including a two-request test proving a follow-up's prompt genuinely contains
+the prior turn's exact question, not just that something was stored - and a parametrized test
+confirming embedding/vector-store/LLM failures all return a clean 503 with no provider-specific
+detail in the body. `ConversationStore` has its own dedicated coverage: creating a conversation,
+appending messages in order, a bounded recent-message window (oldest-first, correctly truncated
+and correctly returning everything when there's less than the limit), a missing conversation id
+(`get()` returns `None`; `append_message`/`get_recent_messages` raise
+`ConversationNotFoundError`), and isolation between two unrelated conversations.
+`ChatService` itself has unit-level orchestration tests (stub `AnswerGenerator`, real
+`InMemoryConversationStore`) proving a new chat creates a conversation, a follow-up reuses it,
+both turns get appended, prior turns are actually passed as `history` to `AnswerGenerator`, an
+unknown `conversation_id` falls back to a new conversation rather than erroring, and the
+history window is respected. All of the above run without any external network access, API
+key, or database.
 
 A separate `tests/knowledge/test_pgvector_store_integration.py` exercises `PgVectorStore`
 against a real PostgreSQL+pgvector instance; it's skipped automatically unless `DATABASE_URL`
@@ -418,66 +461,82 @@ async def ingest(self, sources: list[DocumentSource]) -> int: ...
 Retriever  →  VectorSearchResult[]
                     ↓
 AnswerGenerator (Protocol-free, like ChatService)
-  ├── build_context()  →  deterministic text block: document title + section heading + chunk text
-  ├── build_prompt()    →  grounding instructions + context + question
+  ├── build_context()        →  deterministic text block: document title + section heading + chunk text
+  ├── build_history_block()   →  deterministic text block: prior conversation turns (may be empty)
+  ├── build_prompt()           →  grounding instructions + history? + context + question
   └── LLMProvider.generate_reply(prompt)  →  answer
                     ↓
 GroundedAnswer { answer, sources[] }
 ```
 
 - **`AnswerGenerator`** (`app/rag/answer_generator.py`) depends only on the `Retriever` and
-  `LLMProvider` Protocols - never OpenAI, pgvector, or FastAPI directly. It has no Protocol of
-  its own: like `ChatService`, it's application orchestration logic with exactly one real
-  implementation, not an external boundary with swappable backends - testability already comes
-  from `Retriever`/`LLMProvider` each being fakeable.
+  `LLMProvider` Protocols - never OpenAI, pgvector, ConversationStore, or FastAPI directly. It
+  has no Protocol of its own: like `ChatService`, it's application orchestration logic with
+  exactly one real implementation, not an external boundary with swappable backends -
+  testability already comes from `Retriever`/`LLMProvider` each being fakeable.
 - **Context construction** (`build_context`) is a small, pure, directly-tested function. It
   includes only `document_title`, `section_heading`, and `text` per retrieved chunk - not
   `score`/`id`/`position`, which mean nothing to the model and would just be prompt noise.
   Same input always produces the same string.
+- **Conversation history** (Step 13): `answer(question, history: list[ConversationMessage] =
+  None)` gained an optional parameter - not a new constructor dependency. History is *data*
+  passed per call, not a boundary `AnswerGenerator` depends on; its own dependency graph
+  (`Retriever`, `LLMProvider`) is exactly what it was in Step 11. `build_history_block` formats
+  prior turns as `"User: ...\nAssistant: ..."`; `build_prompt` omits the "Conversation so far"
+  section entirely when there's no history, so Step 11's original prompt shape (and its
+  existing tests) are unchanged for a first turn.
 - **Grounding**: a fixed, concise system instruction (not configuration - see Configuration
-  below for why) tells the model to answer only from the supplied context, never invent
-  policies/prices/requirements/availability, and say so explicitly when the context is
-  insufficient. `LLMProvider.generate_reply()` still takes one plain string, unchanged from
-  Step 3/4 - the instructions, context, and question are composed into that single string by
-  `build_prompt()`, so the existing `LLMProvider` Protocol needed no changes.
+  below for why) tells the model to answer only from the supplied knowledge context, never
+  invent policies/prices/requirements/availability, and say so explicitly when the context is
+  insufficient - plus one more sentence added in Step 13: conversation history is for
+  understanding what's already been discussed, never a source of policies/prices/requirements/
+  availability itself, only the knowledge context is. `LLMProvider.generate_reply()` still
+  takes one plain string, unchanged since Step 3/4 - grounding instructions, history, context,
+  and question are all composed into that single string by `build_prompt()`.
 - **Empty retrieval**: if `Retriever.retrieve()` returns no results, `AnswerGenerator` returns
   a fixed `NOT_AVAILABLE_ANSWER` and **never calls the LLM** - tested explicitly. The
   application layer decides "we have nothing relevant," not the model.
 - **Similarity threshold**: unchanged from Step 10 - `AnswerGenerator` does not add a second
   threshold. `Retriever`'s `min_score` (still off by default) remains the only place that
   decides which results are relevant enough to use.
-- **`ChatService` integration**: as of Step 12, `ChatService` delegates to `AnswerGenerator`
-  (see Chat API integration below) rather than folding retrieval into `ChatService` directly -
-  `ChatService` would otherwise duplicate orchestration `AnswerGenerator` already owns, and the
-  provider-agnostic `LLMProvider` boundary stays cleanest when exactly one thing composes it
-  for grounded answers (`AnswerGenerator`) and `ChatService` just calls that.
+- **`ChatService` integration**: as of Step 12 (and unchanged in shape by Step 13),
+  `ChatService` delegates to `AnswerGenerator` (see Chat API integration below) rather than
+  folding retrieval into `ChatService` directly - `ChatService` would otherwise duplicate
+  orchestration `AnswerGenerator` already owns, and the provider-agnostic `LLMProvider`
+  boundary stays cleanest when exactly one thing composes it for grounded answers
+  (`AnswerGenerator`) and `ChatService` just calls that, now also coordinating
+  `ConversationStore` alongside it.
 
 ## Chat API integration
 
 ```
 POST /api/v1/chat
   ↓
-ChatRequest (validated)
+ChatRequest { message, conversation_id? } (validated)
   ↓
-ChatService.get_reply()
+ChatService.get_reply()  →  ConversationStore.get/create + get_recent_messages
   ↓
-AnswerGenerator.answer()  →  GroundedAnswer { answer, sources[] }
+AnswerGenerator.answer(message, history)  →  GroundedAnswer { answer, sources[] }
   ↓
-ChatResponse { reply, sources[] }
+ChatService  →  ConversationStore.append_message() x2 (user, then assistant)
+  ↓
+ChatResponse { reply, sources[], conversation_id }
 ```
 
-- **`ChatService`** (`app/chats/service.py`) now holds an `AnswerGenerator`, not an
-  `LLMProvider` - it knows WHAT it needs (an answer to a message), never that retrieval,
-  embeddings, vector search, or an LLM SDK are involved. `get_chat_service()` is the one
-  FastAPI-`Depends()`-wired seam in this whole chain: it resolves `Settings` via
-  `Depends(get_settings)`, then calls the plain `get_answer_generator(settings)` composition
-  function - the same bridge pattern every other layer's composition function already
-  documented as its own eventual FastAPI entry point.
-- **Response contract**: `ChatResponse` gained `sources: list[AnswerSource]` alongside the
-  existing `reply: str` - reusing `AnswerSource` from `app/rag/models.py` directly rather than
-  redefining an identical schema. Only `document_title` and `section_heading` are exposed;
-  chunk text, ids, positions, and similarity scores are not - a user can see *where* an answer
-  came from without the response leaking internal retrieval detail. `ChatRequest` is unchanged.
+- **`ChatService`** (`app/chats/service.py`) now holds an `AnswerGenerator` *and* a
+  `ConversationStore` - it knows WHAT it needs (an answer to a message, in the context of a
+  conversation), never that retrieval, embeddings, vector search, an LLM SDK, or conversation
+  persistence are involved. `get_chat_service()` is the one FastAPI-`Depends()`-wired seam in
+  this whole chain: it resolves `Settings` via `Depends(get_settings)`, then calls the plain
+  `get_answer_generator(settings)`/`get_conversation_store(settings)` composition functions -
+  the same bridge pattern every other layer's composition function already documented as its
+  own eventual FastAPI entry point.
+- **Request/response contract** (see Conversation context section for the full decision):
+  `ChatRequest` gained an optional `conversation_id`; `ChatResponse` gained
+  `conversation_id: str` alongside the existing `reply: str` and `sources: list[AnswerSource]`
+  (`AnswerSource` still reused directly from `app/rag/models.py`, not redefined). A client that
+  ignores `conversation_id` entirely still works exactly as before - each request just starts
+  and immediately ends its own new conversation.
 - **Runtime knowledge availability**: `InMemoryVectorStore` (the default) is empty at the start
   of every process, and - a real bug caught while building this step - `get_vector_store()`
   used to construct a *fresh* instance on every call, so even a populated store would never
@@ -500,6 +559,85 @@ ChatResponse { reply, sources[] }
   retrieval result still returns `200` with the deterministic "not available" reply (unchanged
   from Step 11) - neither is treated as an error.
 
+## Conversation context
+
+```
+Conversation { id, messages[] }
+ConversationMessage { role, content, created_at }
+        ↓
+ConversationStore (Protocol)
+        ↑
+InMemoryConversationStore
+```
+
+**Knowledge base vs. conversation memory - kept strictly separate.** The knowledge base
+(`app/knowledge`) is car-rental policies/services/documents/embeddings/vector search - facts
+about the business. Conversation memory (`app/conversation`) is which messages were exchanged,
+in what order, in which conversation - a record of a dialogue, not a fact about car rentals.
+Conversation messages are never embedded and never written to `VectorStore`; the two domains
+share no model, no table, no store.
+
+**Scope decision: `ConversationStore` Protocol + `InMemoryConversationStore` only** - no
+PostgreSQL-backed implementation yet. Considered:
+1. In-memory store only (chosen)
+2. PostgreSQL-backed persistence now
+3. Some other approach
+
+Chosen (1), for the same reason every other boundary in this codebase started this way
+(`LLMProvider`, `EmbeddingProvider`, `VectorStore`): build the Protocol and prove the actual
+use case first, add a real backend once something concretely needs it. Nothing does yet - there
+is no authentication, no multi-process deployment, and no requirement for a conversation to
+outlive the process. An in-process store is an honest match for what this stage needs, not a
+shortcut around a "real" implementation. The Protocol is already shaped for a future
+`PgVectorStore`-style implementation reusing Step 9's exact SQLAlchemy Core pattern (a table
+keyed by conversation id and message order) - the trade-off of deferring it is that a process
+restart currently loses all conversations, acceptable for a local-development-stage prototype
+but not for production, which is explicitly out of scope for this step.
+
+**Models** — deliberately minimal: `ConversationMessage` is `role` (`"user"` | `"assistant"`),
+`content`, `created_at` (needed so a future SQL-backed store has something real to `ORDER BY` -
+list position alone doesn't survive a database round-trip the way it does in memory).
+`Conversation` is just `id` (a random UUID, not sequential/guessable - server-generated, a
+client never invents one) plus its `messages`. No user/auth ids, no rental/booking ids, no
+analytics, no token accounting, no tool-call state, no message embeddings - all later steps.
+
+**`ConversationStore`** exposes exactly four operations, not generic CRUD: `create()`, `get()`
+(returns `Optional[Conversation]` - a normal, expected outcome for an unknown id, not an
+error), `append_message()`, and `get_recent_messages()` (oldest-first, ready to read top to
+bottom into a prompt). The latter two raise `ConversationNotFoundError` for an unknown id,
+since by the time either is called `ChatService` has already established the conversation
+exists - a genuine bug if this ever surfaces at the HTTP layer, so it isn't mapped to any
+response status (see Chat API integration's error handling). Like `VectorStore`'s in-memory
+implementation, `get_conversation_store()` returns a process-wide singleton for the "memory"
+provider (otherwise one request's appended messages would be invisible to the next).
+
+**Memory strategy - bounded recent-message window, nothing more.** `ChatService` loads the
+last `conversation_history_window` messages (default `6`, ~3 user/assistant turns) before
+calling `AnswerGenerator`, and appends the new user+assistant messages afterward. No
+summarization, no long-term/semantic memory - explicitly out of scope for this step, and
+premature before there's a real usage pattern to design either against.
+
+**RAG interaction - retrieval stays focused on the current question.** Conversation history is
+never concatenated into the vector-search query; `Retriever.retrieve()` still receives only the
+bare current message, unchanged from Step 10 (verified by
+`test_retrieve_is_called_with_only_the_current_question_not_history`). History only enters the
+*LLM prompt*, as its own labeled section, separate from the knowledge context - a deliberate,
+minimal choice, not an oversight: naively appending prior turns to the search query would drift
+the query away from the user's actual current information need (e.g. a short follow-up like
+"and what about deposits?" would search on the whole conversation's text, not just "deposits").
+Rewriting a follow-up into a standalone, retrieval-friendly query is real, valuable, and
+explicitly deferred - a future step's job once there's a concrete case to design it against.
+
+**Chat API contract.** `ChatRequest.conversation_id` is optional; omit it to start a new
+conversation, supply a previously-returned one to continue it. `ChatResponse.conversation_id`
+is always present, so the client always knows which id to use next - including after an
+unknown/stale id silently starts a fresh conversation instead of erroring (a `ChatService`
+policy decision, not a `ConversationStore` one: the store's `get()` just reports "not found";
+what to *do* about that is the application layer's call). `Conversation.id` (a random UUID) is
+used directly as the public identifier - there is no separate internal-vs-public id layer,
+because nothing today (no auth, no multi-tenancy) needs one; a real internal database key,
+when one exists, would need hiding for different reasons than a UUID already satisfies.
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -514,7 +652,10 @@ ChatResponse { reply, sources[] }
 - [x] Ingestion orchestration (`IngestionService`, not an endpoint)
 - [x] RAG / grounded answering (`AnswerGenerator`)
 - [x] Chat API integration (`POST /api/v1/chat` connected to the full RAG pipeline)
-- [ ] Conversation memory / chat history persistence
+- [x] Conversation context foundation (`ConversationStore`, bounded recent-message window,
+      multi-turn `/api/v1/chat` - in-memory only, single-process)
+- [ ] PostgreSQL-backed conversation persistence
+- [ ] Long-term/semantic conversation memory, summarization, query rewriting for follow-ups
 - [ ] Car-rental tools / function calling
 - [ ] Agent orchestration / autonomous planning
 - [ ] Q&A evaluation/improvement loop
@@ -529,8 +670,12 @@ ChatResponse { reply, sources[] }
   manual container or global state.
 - **Provider boundaries** — external systems (LLM SDKs, PDF libraries) sit behind a Protocol
   defined by the application layer, never imported by the code that consumes them.
-- **Framework-independent knowledge and RAG layers** — neither `app/knowledge` nor `app/rag`
-  has a FastAPI dependency, so both are usable (and testable) outside a request/response cycle.
+- **Framework-independent knowledge, RAG, and conversation layers** — none of `app/knowledge`,
+  `app/rag`, or `app/conversation` has a FastAPI dependency, so all three are usable (and
+  testable) outside a request/response cycle.
+- **Separate domains stay separate** — the knowledge base (car-rental facts, embeddings, vector
+  search) and conversation memory (dialogue identity, ordering, history) share no model, table,
+  or store, even though both now feed the same `AnswerGenerator` prompt.
 - **Testability** — every provider boundary has a fake/mocked counterpart so the full test
   suite runs with no network access and no API keys.
 - **No leaking internal failures to the client** — provider/storage exceptions are already

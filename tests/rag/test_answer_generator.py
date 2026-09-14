@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from app.conversation.models import ConversationMessage
 from app.knowledge.exceptions import EmbeddingProviderError, VectorStoreError
 from app.knowledge.models import DocumentChunk
 from app.knowledge.vector_store import VectorSearchResult
@@ -10,6 +11,7 @@ from app.rag.answer_generator import (
     NOT_AVAILABLE_ANSWER,
     AnswerGenerator,
     build_context,
+    build_history_block,
     build_prompt,
 )
 
@@ -151,3 +153,64 @@ def test_answer_propagates_llm_provider_errors():
 
     with pytest.raises(LLMProviderError):
         asyncio.run(generator.answer("question"))
+
+
+def test_build_history_block_is_empty_for_no_history():
+    assert build_history_block(None) == ""
+    assert build_history_block([]) == ""
+
+
+def test_build_history_block_formats_roles_and_content_in_order():
+    history = [
+        ConversationMessage(role="user", content="What is the deposit?"),
+        ConversationMessage(role="assistant", content="It is 5,000 THB."),
+    ]
+
+    block = build_history_block(history)
+
+    assert block == "User: What is the deposit?\nAssistant: It is 5,000 THB."
+
+
+def test_build_prompt_omits_history_section_when_no_history():
+    prompt = build_prompt("question", "context")
+
+    assert "Conversation so far" not in prompt
+
+
+def test_build_prompt_includes_history_section_when_history_given():
+    history = [ConversationMessage(role="user", content="Earlier question")]
+
+    prompt = build_prompt("question", "context", history)
+
+    assert "Conversation so far:" in prompt
+    assert "User: Earlier question" in prompt
+
+
+def test_answer_passes_history_into_the_prompt_sent_to_the_llm():
+    llm = StubLLMProvider()
+    retriever = StubRetriever(results=[_result("Policies", "1. Eligibility", "Minimum Age: 21.")])
+    generator = AnswerGenerator(retriever, llm)
+    history = [
+        ConversationMessage(role="user", content="What documents do I need?"),
+        ConversationMessage(role="assistant", content="A driver's license and ID."),
+    ]
+
+    asyncio.run(generator.answer("And what about payment?", history=history))
+
+    prompt = llm.received_prompts[0]
+    assert "Conversation so far:" in prompt
+    assert "User: What documents do I need?" in prompt
+    assert "Assistant: A driver's license and ID." in prompt
+
+
+def test_retrieve_is_called_with_only_the_current_question_not_history():
+    """Retrieval must stay focused on the current information need - see
+    README's RAG interaction note. history must never reach Retriever.
+    """
+    retriever = StubRetriever(results=[_result("Doc", "1. Section", "text")])
+    generator = AnswerGenerator(retriever, StubLLMProvider())
+    history = [ConversationMessage(role="user", content="unrelated earlier question")]
+
+    asyncio.run(generator.answer("current question", history=history))
+
+    assert retriever.calls == ["current question"]

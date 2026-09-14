@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel, Field, field_validator
 
 from app.rag.models import AnswerSource
@@ -5,6 +7,11 @@ from app.rag.models import AnswerSource
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
+    conversation_id: Optional[str] = Field(
+        default=None,
+        description="Omit to start a new conversation; pass a previously "
+        "returned conversation_id to continue one.",
+    )
 
     @field_validator("message")
     @classmethod
@@ -18,3 +25,4 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     sources: list[AnswerSource]
+    conversation_id: str

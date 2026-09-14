@@ -10,7 +10,7 @@ class FailingChatService:
     def __init__(self, error: Exception) -> None:
         self._error = error
 
-    async def get_reply(self, message: str) -> None:
+    async def get_reply(self, message: str, conversation_id=None) -> None:
         raise self._error
 
 

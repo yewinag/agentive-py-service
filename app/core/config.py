@@ -57,6 +57,20 @@ class Settings(BaseSettings):
     # model/knowledge base. See README's Retrieval section.
     retrieval_min_score: Optional[float] = None
 
+    # Selects the ConversationStore implementation in
+    # app/conversation/store.py. Only "memory" is implemented today; kept
+    # as a setting (matching every other swappable boundary) so a future
+    # PostgreSQL-backed store slots in without touching ChatService.
+    conversation_store_provider: str = "memory"
+
+    # Bounded conversation context sent to the LLM alongside the current
+    # question: the last N messages (~history_window/2 user+assistant
+    # turns). 6 = 3 turns - enough for short-term follow-up context
+    # without unbounded prompt growth. Not calibrated against real usage
+    # data (no evaluation loop exists yet - see README), so treated as a
+    # safe, conservative default rather than a precisely tuned number.
+    conversation_history_window: int = 6
+
 
 @lru_cache
 def get_settings() -> Settings:
