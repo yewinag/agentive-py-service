@@ -13,24 +13,29 @@ Frontend
 Main Business API
   ↓
 FastAPI Agentive Service
-  ├── Chat            (app/chats)
-  ├── LLM Provider     (app/llm)
-  └── Knowledge Pipeline (app/knowledge)
+  ├── Chat              (app/chats)
+  ├── RAG / Answering    (app/rag)
+  ├── LLM Provider        (app/llm)
+  └── Knowledge Pipeline   (app/knowledge)
 ```
 
-Three boundaries, each with a single responsibility:
+Four boundaries, each with a single responsibility:
 
 - **Chat/application layer** (`app/chats`) — orchestrates one request: validates input,
-  calls the layers below it, shapes the response. No LLM- or document-specific logic lives
-  here.
+  calls the layers below it, shapes the response. Still depends only on `LLMProvider` today;
+  not yet connected to retrieval/RAG (see RAG section below for why).
+- **RAG / grounded-answering layer** (`app/rag`) — combines retrieval and LLM generation into
+  one grounded answer, behind `AnswerGenerator`. Depends on the `Retriever` and `LLMProvider`
+  Protocols only.
 - **LLM provider layer** (`app/llm`) — answers "how do we generate a reply?" behind an
   `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
-  is swappable without touching the chat layer.
+  is swappable without touching the chat or RAG layers.
 - **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
-  embeddable, storable, and now searchable units: extraction (`DocumentExtractor`), chunking
-  (`DocumentChunker`), embedding (`EmbeddingProvider`), vector storage (`VectorStore`), and
-  semantic retrieval (`Retriever`), each behind its own Protocol. Framework-independent: it
-  doesn't import FastAPI and isn't wired into any endpoint yet.
+  embeddable, storable, and searchable units: extraction (`DocumentExtractor`), chunking
+  (`DocumentChunker`), embedding (`EmbeddingProvider`), vector storage (`VectorStore`),
+  semantic retrieval (`Retriever`), and now ingestion orchestration (`IngestionService`,
+  composing the previous four), each behind its own Protocol where one is warranted.
+  Framework-independent: it doesn't import FastAPI and isn't wired into any endpoint yet.
 
 ## Current implementation status
 
@@ -50,12 +55,14 @@ Three boundaries, each with a single responsibility:
 - `VectorStore` Protocol, with in-memory and PostgreSQL+pgvector implementations
 - `Retriever` Protocol, with a `VectorRetriever` implementation (semantic retrieval: query →
   embedding → vector search → ranked chunks)
+- `IngestionService` (composes extraction → chunking → embedding → vector storage into one
+  operation; not an HTTP endpoint)
+- `AnswerGenerator` (RAG: retrieval → grounded prompt → `LLMProvider` → answer + sources)
 - Unit/integration tests
 
 **Not implemented yet:**
-- Document ingestion pipeline/endpoint (the stages above aren't wired together yet)
-- RAG (LLM answer generation grounded in retrieved chunks)
-- `ChatService` integration with retrieval
+- `ChatService`/`/api/v1/chat` integration with retrieval (see RAG section — deliberately
+  deferred, not forgotten)
 - Car-rental tools
 - Agent/tool orchestration
 - Conversation persistence
@@ -69,8 +76,10 @@ app/
 ├── chats/           # Chat feature: router, schemas, ChatService
 ├── core/             # Cross-cutting config (Settings)
 ├── health/           # Health-check endpoint
-├── knowledge/         # Document contracts, extraction, chunking, embedding, storage, retrieval
-└── llm/               # LLMProvider Protocol + fake/OpenAI implementations
+├── knowledge/         # Document contracts, extraction, chunking, embedding, storage,
+│                       # retrieval, and ingestion orchestration
+├── llm/               # LLMProvider Protocol + fake/OpenAI implementations
+└── rag/                # AnswerGenerator: Retriever + LLMProvider -> grounded answer
 
 tests/                # Mirrors the app/ layout, one test package per feature
 data/
@@ -80,54 +89,36 @@ docker-compose.yml     # Local PostgreSQL + pgvector, for VECTOR_STORE_PROVIDER=
 
 ## Knowledge pipeline
 
-**Current — ingestion** (each stage implemented and tested; not yet wired together into one
-ingestion flow — there is no ingestion endpoint or script that runs all of them in sequence):
+**Ingestion** (`IngestionService`, composing existing components - implemented and tested,
+not exposed as an endpoint - see Ingestion section below):
 ```
 PDF
   ↓
-PdfDocumentExtractor
+PdfDocumentExtractor  →  ExtractedDocument
   ↓
-ExtractedDocument
+SectionAwareChunker    →  DocumentChunk[]
   ↓
-SectionAwareChunker
+EmbeddingProvider       →  embedding vector[]
   ↓
-DocumentChunk[]
-  ↓
-EmbeddingProvider
-  ↓
-embedding vector[]
-  ↓
-VectorStore
-  ↓
-persisted, searchable chunks
+VectorStore              →  persisted, searchable chunks
 ```
 
-**Current — retrieval** (implemented and tested; not yet reachable via any endpoint):
+**Retrieval + RAG** (implemented and tested; not yet reachable via any endpoint):
 ```
 user query
   ↓
-Retriever
+Retriever  →  EmbeddingProvider  →  VectorStore.search()  →  ranked VectorSearchResult[]
   ↓
-EmbeddingProvider  →  query embedding
-  ↓
-VectorStore.search()
-  ↓
-ranked VectorSearchResult[]
+AnswerGenerator  →  grounded prompt  →  LLMProvider  →  answer + sources
 ```
 
-**Planned:**
-```
-ranked VectorSearchResult[]
-  ↓
-RAG (prompt construction + LLM)
-```
-
-Retrieval finds relevant chunks; it does not yet generate an answer. Turning retrieved chunks
-into an LLM-generated reply (RAG), wiring this into `ChatService`, tools, agent orchestration,
-and conversation memory are all still future work.
+Every stage above is implemented and tested. What's still missing is *wiring*: no HTTP
+endpoint triggers ingestion, and `ChatService`/`/api/v1/chat` doesn't call `AnswerGenerator`
+yet (see the RAG section for why that's deliberate). Tools, agent orchestration, and
+conversation memory remain future work.
 
 The two PDFs in `data/knowledge/` (`car-rental-services.pdf`, `car-rental-policies.pdf`) are
-the initial car-rental knowledge sources this pipeline will eventually be built around.
+the car-rental knowledge sources this pipeline is built and tested around.
 
 ## LLM provider architecture
 
@@ -189,6 +180,12 @@ RETRIEVAL_TOP_K=5                    # default VectorRetriever.retrieve() top_k
 `.env` is gitignored and must never be committed — only `.env.example`, with placeholder
 values, is tracked.
 
+No new settings were needed for ingestion or RAG: both reuse `embedding_provider`,
+`vector_store_provider`, `llm_provider`, and `retrieval_top_k`/`retrieval_min_score` as-is. The
+grounding system prompt is a fixed code constant, not a setting - it's not something that
+should vary by environment, and making it configurable would just be a place for
+inconsistent/untested prompt variants to creep in.
+
 ## Testing
 
 ```bash
@@ -201,9 +198,13 @@ behavior), the knowledge-document contracts, the PDF extractor (including an int
 against the real PDFs in `data/knowledge/`), section-aware chunking (including chunk
 statistics against the real PDFs), the embedding provider abstraction (fake, and OpenAI with a
 mocked SDK client), the vector store abstraction (in-memory unit tests plus
-provider-selection/config-failure behavior), and the retrieval layer (orchestration tests with
+provider-selection/config-failure behavior), the retrieval layer (orchestration tests with
 stub providers/stores, plus a deterministic end-to-end test using the real
-`FakeEmbeddingProvider` + `InMemoryVectorStore`). All of the above run without any external
+`FakeEmbeddingProvider` + `InMemoryVectorStore`), `IngestionService` (fake-provider unit tests
+plus an integration test processing the two real PDFs through the real extractor/chunker), and
+`AnswerGenerator` (orchestration tests with stub `Retriever`/`LLMProvider`, plus a full
+end-to-end test chaining `FakeDocumentExtractor → SectionAwareChunker → FakeEmbeddingProvider →
+InMemoryVectorStore → Retriever → FakeLLMProvider`). All of the above run without any external
 network access, API key, or database.
 
 A separate `tests/knowledge/test_pgvector_store_integration.py` exercises `PgVectorStore`
@@ -353,6 +354,77 @@ VectorRetriever
   endpoint. It composes its own `EmbeddingProvider`/`VectorStore` via their existing
   composition points rather than deciding providers itself.
 
+## Ingestion
+
+`IngestionService` (`app/knowledge/ingestion.py`) composes the four existing knowledge Protocols
+into one operation - `DocumentExtractor → DocumentChunker → EmbeddingProvider → VectorStore` -
+reimplementing none of them:
+
+```python
+async def ingest(self, sources: list[DocumentSource]) -> int: ...
+```
+
+- Extraction and chunking are **not** `Settings`-selected the way the LLM/embedding/vector-store
+  providers are: there's only one real implementation of each worth choosing for actual
+  ingestion (`PdfDocumentExtractor`, `SectionAwareChunker`) - the `Fake*` variants exist purely
+  for tests, never as a real ingestion option, so there's nothing to select between.
+- Deliberately **not an HTTP endpoint**: ingestion is an occasional, batch operation (run when
+  the knowledge base changes), not a per-request one. No file upload API, admin CRUD, or
+  scheduling - those are separate future concerns, out of scope for this foundation.
+- `add()` on `VectorStore` is upsert-by-chunk-id, so re-running ingestion on the same sources
+  doesn't duplicate chunks - verified by `tests/knowledge/test_ingestion_integration.py`, which
+  ingests the two real PDFs twice and confirms the stored count doesn't grow.
+- `get_ingestion_service(settings)` is the composition point, following the same
+  plain-function, no-`Depends()` pattern as every other `app/knowledge` composition function.
+
+## RAG / grounded answering
+
+```
+Retriever  →  VectorSearchResult[]
+                    ↓
+AnswerGenerator (Protocol-free, like ChatService)
+  ├── build_context()  →  deterministic text block: document title + section heading + chunk text
+  ├── build_prompt()    →  grounding instructions + context + question
+  └── LLMProvider.generate_reply(prompt)  →  answer
+                    ↓
+GroundedAnswer { answer, sources[] }
+```
+
+- **`AnswerGenerator`** (`app/rag/answer_generator.py`) depends only on the `Retriever` and
+  `LLMProvider` Protocols - never OpenAI, pgvector, or FastAPI directly. It has no Protocol of
+  its own: like `ChatService`, it's application orchestration logic with exactly one real
+  implementation, not an external boundary with swappable backends - testability already comes
+  from `Retriever`/`LLMProvider` each being fakeable.
+- **Context construction** (`build_context`) is a small, pure, directly-tested function. It
+  includes only `document_title`, `section_heading`, and `text` per retrieved chunk - not
+  `score`/`id`/`position`, which mean nothing to the model and would just be prompt noise.
+  Same input always produces the same string.
+- **Grounding**: a fixed, concise system instruction (not configuration - see Configuration
+  below for why) tells the model to answer only from the supplied context, never invent
+  policies/prices/requirements/availability, and say so explicitly when the context is
+  insufficient. `LLMProvider.generate_reply()` still takes one plain string, unchanged from
+  Step 3/4 - the instructions, context, and question are composed into that single string by
+  `build_prompt()`, so the existing `LLMProvider` Protocol needed no changes.
+- **Empty retrieval**: if `Retriever.retrieve()` returns no results, `AnswerGenerator` returns
+  a fixed `NOT_AVAILABLE_ANSWER` and **never calls the LLM** - tested explicitly. The
+  application layer decides "we have nothing relevant," not the model.
+- **Similarity threshold**: unchanged from Step 10 - `AnswerGenerator` does not add a second
+  threshold. `Retriever`'s `min_score` (still off by default) remains the only place that
+  decides which results are relevant enough to use.
+- **Sources stay internal for now**: `GroundedAnswer.sources` (document title + section heading
+  per retrieved chunk) is captured and tested, but not exposed through the public
+  `/api/v1/chat` response yet. Changing `ChatResponse` is a real API contract decision better
+  made deliberately, together with actually wiring retrieval into chat - not as a side effect
+  of building the RAG layer in isolation.
+- **`ChatService` integration**: not done this step, by design. `ChatService`/`/api/v1/chat`
+  are unchanged. The recommended target design is a *separate* service (what `AnswerGenerator`
+  already is) rather than folding retrieval into `ChatService` directly - `ChatService` would
+  otherwise duplicate orchestration `AnswerGenerator` already owns, and the existing
+  provider-agnostic `LLMProvider` boundary stays cleanest when exactly one thing composes it
+  for chat-shaped replies (`ChatService`) and exactly one thing composes it for grounded
+  answers (`AnswerGenerator`). Wiring `ChatService` to call `AnswerGenerator` - and deciding
+  what `/api/v1/chat`'s response should look like once it does - is left for a following step.
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -364,8 +436,9 @@ VectorRetriever
 - [x] Embedding provider
 - [x] Vector store foundation
 - [x] Semantic retrieval
-- [ ] Document ingestion pipeline
-- [ ] RAG
+- [x] Ingestion orchestration (`IngestionService`, not an endpoint)
+- [x] RAG / grounded answering (`AnswerGenerator`, not wired into `/api/v1/chat` yet)
+- [ ] `ChatService`/`/api/v1/chat` integration with RAG
 - [ ] Car-rental tools
 - [ ] Agent orchestration
 - [ ] Conversation/Q&A evaluation loop
@@ -378,8 +451,8 @@ VectorRetriever
   manual container or global state.
 - **Provider boundaries** — external systems (LLM SDKs, PDF libraries) sit behind a Protocol
   defined by the application layer, never imported by the code that consumes them.
-- **Framework-independent knowledge layer** — `app/knowledge` has no FastAPI dependency,
-  so it's usable (and testable) outside a request/response cycle.
+- **Framework-independent knowledge and RAG layers** — neither `app/knowledge` nor `app/rag`
+  has a FastAPI dependency, so both are usable (and testable) outside a request/response cycle.
 - **Testability** — every provider boundary has a fake/mocked counterpart so the full test
   suite runs with no network access and no API keys.
 - **Incremental implementation** — each layer is built with only as much abstraction as its
