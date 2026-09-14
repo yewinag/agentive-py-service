@@ -16,10 +16,24 @@ def test_extracted_document_rejects_empty_text():
 
 def test_document_chunk_rejects_negative_position():
     with pytest.raises(ValidationError):
-        DocumentChunk(id="chunk-1", document_id="doc-1", text="chunk text", position=-1)
+        DocumentChunk(
+            id="chunk-1",
+            document_id="doc-1",
+            document_title="Title",
+            text="chunk text",
+            position=-1,
+        )
 
 
 def test_document_chunk_accepts_valid_data():
-    chunk = DocumentChunk(id="chunk-1", document_id="doc-1", text="chunk text", position=0)
+    chunk = DocumentChunk(
+        id="chunk-1",
+        document_id="doc-1",
+        document_title="Title",
+        section_heading="1. Intro",
+        text="chunk text",
+        position=0,
+    )
 
     assert chunk.position == 0
+    assert chunk.section_heading == "1. Intro"

@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -26,13 +28,15 @@ class ExtractedDocument(BaseModel):
 
 
 class DocumentChunk(BaseModel):
-    """One retrievable unit of an ExtractedDocument.
-
-    The chunking algorithm itself isn't implemented yet - this is the
-    shape a future chunker, embedder, and retriever will all agree on.
+    """One retrievable unit of an ExtractedDocument, produced by a
+    DocumentChunker. Carries enough of the parent document's identity and
+    structure that it's usable on its own once retrieved, without a join
+    back to the source document.
     """
 
     id: str = Field(..., min_length=1)
     document_id: str = Field(..., min_length=1)
+    document_title: str = Field(..., min_length=1)
+    section_heading: Optional[str] = Field(default=None)
     text: str = Field(..., min_length=1)
     position: int = Field(..., ge=0)
