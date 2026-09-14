@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     # safe, conservative default rather than a precisely tuned number.
     conversation_history_window: int = 6
 
+    # Selects the BusinessServiceClient implementation in
+    # app/tools/business_client.py. Only "fake" is implemented today; kept
+    # as a setting (matching every other swappable boundary) so a real
+    # HTTP client calling the NestJS Business API slots in without
+    # touching any tool. See README's Tools section for why the real
+    # client is deliberately deferred.
+    business_service_provider: str = "fake"
+
 
 @lru_cache
 def get_settings() -> Settings:

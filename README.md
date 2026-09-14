@@ -13,18 +13,20 @@ Frontend
 Main Business API
   ↓
 FastAPI Agentive Service
-  ├── Chat                  (app/chats)
-  ├── Conversation Memory     (app/conversation)
-  ├── RAG / Answering          (app/rag)
-  ├── LLM Provider               (app/llm)
-  └── Knowledge Pipeline           (app/knowledge)
+  ├── Chat                      (app/chats)
+  ├── Conversation Memory         (app/conversation)
+  ├── RAG / Answering               (app/rag)
+  ├── Tools                           (app/tools)  →  (future) NestJS Business API
+  ├── LLM Provider                       (app/llm)
+  └── Knowledge Pipeline                   (app/knowledge)
 ```
 
-Five boundaries, each with a single responsibility:
+Six boundaries, each with a single responsibility:
 
 - **Chat/application layer** (`app/chats`) — orchestrates one HTTP request: validates input,
   resolves/continues a conversation, delegates to `AnswerGenerator` via `ChatService`, shapes
-  the response. `POST /api/v1/chat` returns a knowledge-grounded, multi-turn-aware answer.
+  the response. `POST /api/v1/chat` returns a knowledge-grounded, multi-turn-aware answer. Not
+  yet connected to `app/tools` - see Tools section for why.
 - **Conversation memory layer** (`app/conversation`) — a domain deliberately separate from the
   knowledge base (see Conversation context section below): identity, ordering, and bounded
   recent-history for a conversation, behind `ConversationStore`. Holds no car-rental knowledge,
@@ -32,9 +34,15 @@ Five boundaries, each with a single responsibility:
 - **RAG / grounded-answering layer** (`app/rag`) — combines retrieval, bounded conversation
   context, and LLM generation into one grounded answer, behind `AnswerGenerator`. Depends on
   the `Retriever` and `LLMProvider` Protocols only. `ChatService` is its one real consumer.
+- **Tools layer** (`app/tools`) — a domain deliberately separate from both the knowledge base
+  and the business backend itself (see Tools section below): describes and executes dynamic
+  business operations (today: vehicle availability) behind a `Tool` Protocol and a
+  `ToolRegistry`, talking to the business system through a `BusinessServiceClient` Protocol.
+  Owns no rental inventory, booking state, or customer data - it's an integration boundary, not
+  a business-domain owner. Not yet connected to any LLM/agent decision loop or any endpoint.
 - **LLM provider layer** (`app/llm`) — answers "how do we generate a reply?" behind an
   `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
-  is swappable without touching the chat, conversation, or RAG layers.
+  is swappable without touching the chat, conversation, RAG, or tools layers.
 - **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
   embeddable, storable, and searchable units: extraction (`DocumentExtractor`), chunking
   (`DocumentChunker`), embedding (`EmbeddingProvider`), vector storage (`VectorStore`),
@@ -73,14 +81,22 @@ Five boundaries, each with a single responsibility:
   from the knowledge base, never stored in the vector store)
 - Multi-turn conversations over `POST /api/v1/chat`: an optional `conversation_id` in the
   request, echoed in the response, carrying a bounded recent-message window into the prompt
+- `Tool` Protocol, `ToolMetadata`, and `ToolRegistry` (register/resolve/list - no dynamic
+  plugin loading)
+- `BusinessServiceClient` Protocol, with a fake/deterministic implementation
+- One concrete tool: `check_vehicle_availability` (dynamic availability lookup, validated
+  input, distinguishing input/business-service/execution failures)
 - Unit/integration tests
 
 **Not implemented yet:**
 - Conversation persistence beyond a single process (no PostgreSQL-backed `ConversationStore`
   yet - see Conversation context section for why)
 - Long-term/semantic conversation memory, summarization, or query rewriting for follow-ups
-- Car-rental tools / function calling
+- Real NestJS Business API integration (no HTTP `BusinessServiceClient` yet - see Tools section)
+- LLM tool/function calling - the LLM cannot invoke a tool yet; `ToolRegistry` exists, nothing
+  decides when to use it
 - Agent orchestration / autonomous planning
+- Booking creation, modification, or cancellation of any kind
 - Q&A evaluation/improvement loop
 - Streaming, reranking, hybrid search
 - Authentication, business/rental database integration
@@ -98,7 +114,8 @@ app/
 ├── knowledge/         # Document contracts, extraction, chunking, embedding, storage,
 │                       # retrieval, ingestion orchestration, and startup bootstrap
 ├── llm/               # LLMProvider Protocol + fake/OpenAI implementations
-└── rag/                # AnswerGenerator: Retriever + LLMProvider + history -> grounded answer
+├── rag/                # AnswerGenerator: Retriever + LLMProvider + history -> grounded answer
+└── tools/               # Tool/ToolRegistry, BusinessServiceClient, check_vehicle_availability
 
 tests/                # Mirrors the app/ layout, one test package per feature
 data/
@@ -231,19 +248,19 @@ RETRIEVAL_TOP_K=5                    # default VectorRetriever.retrieve() top_k
 
 CONVERSATION_STORE_PROVIDER=memory   # only "memory" is implemented today
 CONVERSATION_HISTORY_WINDOW=6        # last N messages (~3 turns) sent to the LLM as context
+
+BUSINESS_SERVICE_PROVIDER=fake       # only "fake" is implemented today - see Tools section
 ```
 
 `.env` is gitignored and must never be committed — only `.env.example`, with placeholder
 values, is tracked.
 
-Ingestion and wiring chat to RAG needed no new settings. Step 13 adds exactly two, both
-following existing patterns: `conversation_store_provider` (matches `vector_store_provider`'s
-shape, even with only one working value today - see Conversation context) and
-`conversation_history_window` (an operational tuning knob, matching `retrieval_top_k`'s
-precedent - a bounded window is safe to default without usage data, unlike a similarity
-threshold, which could silently under- or over-filter in either direction if guessed). The
-grounding system prompt remains a fixed code constant, not a setting - it's not something that
-should vary by environment, and making it configurable would just be a place for
+Ingestion and wiring chat to RAG needed no new settings. Step 13 added
+`conversation_store_provider`/`conversation_history_window`; Step 14 adds
+`business_service_provider`, the same shape again - a provider selector kept even with only one
+working value today, so a real NestJS-calling client slots in later without touching any tool.
+The grounding system prompt remains a fixed code constant, not a setting - it's not something
+that should vary by environment, and making it configurable would just be a place for
 inconsistent/untested prompt variants to creep in.
 
 ## Testing
@@ -282,8 +299,13 @@ and correctly returning everything when there's less than the limit), a missing 
 `InMemoryConversationStore`) proving a new chat creates a conversation, a follow-up reuses it,
 both turns get appended, prior turns are actually passed as `history` to `AnswerGenerator`, an
 unknown `conversation_id` falls back to a new conversation rather than erroring, and the
-history window is respected. All of the above run without any external network access, API
-key, or database.
+history window is respected. The tool boundary has its own coverage too: `ToolRegistry`
+(register, resolve, list, unknown-name lookup, duplicate-registration rejection), the metadata/
+input-schema/valid-execution/invalid-input/error-propagation contract for
+`CheckVehicleAvailabilityTool`, `FakeBusinessServiceClient`'s deterministic date-range/category
+filtering, provider-selection composition tests, and an integration test chaining
+`FakeBusinessServiceClient → CheckVehicleAvailabilityTool → ToolRegistry`. All of the above run
+without any external network access, API key, or database.
 
 A separate `tests/knowledge/test_pgvector_store_integration.py` exercises `PgVectorStore`
 against a real PostgreSQL+pgvector instance; it's skipped automatically unless `DATABASE_URL`
@@ -638,6 +660,110 @@ used directly as the public identifier - there is no separate internal-vs-public
 because nothing today (no auth, no multi-tenancy) needs one; a real internal database key,
 when one exists, would need hiding for different reasons than a UUID already satisfies.
 
+## Tools
+
+```
+Tool (Protocol): metadata, execute(raw_input: dict)
+  ↑
+CheckVehicleAvailabilityTool
+  ↓
+BusinessServiceClient (Protocol)
+  ↑
+FakeBusinessServiceClient          (today)
+HTTP client → NestJS Business API  (future, not built)
+```
+
+**RAG/knowledge base vs. tools - the core distinction this step establishes:**
+
+| | Knowledge base (`app/knowledge`, RAG) | Tools (`app/tools`) |
+|---|---|---|
+| Answers | Relatively static knowledge: policies, services, vehicle-use rules, requirements, general pricing *stated in documents* | Dynamic/live business operations: vehicle availability, booking lookup/creation/modification, customer-specific data |
+| Source of truth | The two PDFs, via retrieval | The business system (future: NestJS Business API) |
+| Mechanism | Embedding + vector similarity search | Structured, validated function-style calls |
+
+This Python service must never become the owner of rental business data. `app/tools` is
+explicitly an **integration boundary**, not a business-domain owner - it holds no rental
+inventory, no booking state, no customer records, no authentication, no authorization, no
+pricing rules. All of that belongs to the business backend, today represented only by a fake.
+
+**Scope decision - established the boundary, not the agent.** Built: `Tool` Protocol,
+`ToolMetadata`, `ToolRegistry`, one concrete tool (`check_vehicle_availability`),
+`BusinessServiceClient` Protocol + `FakeBusinessServiceClient`, and tests proving all of it.
+Not built: an autonomous agent loop, LLM tool/function calling, or the real NestJS HTTP client -
+each explained below, deliberately deferred rather than a general-purpose agent framework built
+prematurely.
+
+**`Tool` Protocol** (`app/tools/tool.py`): `metadata: ToolMetadata` (name, description,
+`input_schema: dict`) and `async execute(raw_input: dict) -> BaseModel`. `execute` takes a
+plain, unvalidated dict - the shape an LLM's function-call arguments would actually arrive in -
+and returns each tool's own result model. There is no generic `ToolResult` wrapper: a
+`success`/`data`/`error` envelope would erase what's actually different between tools' results,
+and this codebase already prefers "return the real type, raise on failure" everywhere else
+(`Retriever`, `AnswerGenerator`, ...) over a result-wrapper pattern.
+
+**Tool metadata is provider-agnostic on purpose.** `input_schema` is plain JSON Schema
+(`InputModel.model_json_schema()`), not OpenAI's `{"type": "function", "function": {...}}`
+envelope or any other provider's specific wrapper - JSON Schema is what every major
+function-calling API already expects parameters shaped like, so no adaptation is needed to hand
+this to one, but nothing here commits to a specific provider either.
+
+**`ToolRegistry`** (`app/tools/registry.py`): `register()`, `resolve()` (returns
+`Optional[Tool]` - an unknown name is a normal, expected lookup outcome, matching
+`ConversationStore.get()`'s precedent, not an error the registry itself raises), and
+`list_tools()` (returns `ToolMetadata`, not tool instances - a future agent needs to see what's
+available, not reach into a tool's internals). Deliberately not a plugin system: tools are
+registered explicitly in code (`get_tool_registry()`), never discovered via dynamic imports or
+runtime code loading, so the available-tools list is always the same deterministic set for a
+given process.
+
+**`check_vehicle_availability`** (`app/tools/check_vehicle_availability.py`): input
+`pickup_at`, `return_at` (both required `datetime`s; `return_at` must be strictly after
+`pickup_at` - validated, tested), optional `category` (free-text, not an enum - a vehicle
+category taxonomy is business inventory knowledge, not something this service should hardcode).
+No duration cap or other business-rule validation was added beyond ordering: "how long can a
+rental be" is a business policy question for the backend to own, not a sanity check Python
+should guess at. Result: `available_vehicles: list[VehicleAvailability]`
+(`vehicle_id`, `category`, `model`, `available_from`, `available_until`) - only what a caller
+needs to know availability, no database-specific fields.
+
+**`BusinessServiceClient`** (`app/tools/business_client.py`): one operation today,
+`check_vehicle_availability(start, end, category=None)`, because one tool exists; a future
+booking-lookup/creation tool would add its own method here when it's actually needed, not
+speculatively now. `FakeBusinessServiceClient` is a deterministic test double, not a second
+business database - it holds only whatever fixed vehicle list a test passes in (default: none),
+filtering by date-range containment and category; nothing is ever *written* to it at runtime,
+so there is no pricing, booking, or customer logic to duplicate. The real HTTP client calling
+the NestJS Business API is **not built this step** - nothing in this repository consumes it yet
+(no agent, no endpoint), and building it now would mean guessing at NestJS's request/response
+shapes and auth before there's a concrete contract to build against; `get_business_service_client()`
+already selects by `Settings.business_service_provider`, so adding it later touches no tool.
+
+**Errors** (`app/tools/exceptions.py`) - a small, three-member hierarchy under `ToolError`,
+matching exactly what a future agent needs to distinguish: `ToolInputError` (raw input failed
+the tool's own schema validation), `BusinessServiceUnavailableError` (the business system
+couldn't be reached - raised by `BusinessServiceClient` implementations and left unwrapped by
+the tool, the same "don't re-wrap an already-translated error" pattern `Retriever` uses for
+`EmbeddingProviderError`/`VectorStoreError`), and `ToolExecutionError` (reserved for a tool
+execution failure that is neither of the other two - not actively raised by
+`check_vehicle_availability` today, since its only failure modes so far are exactly the other
+two; kept in the hierarchy for a future tool that needs it).
+
+**Composition**: `get_business_service_client(settings)` and `get_tool_registry(settings)` are
+plain functions, not FastAPI `Depends()`-wired - no endpoint consumes a `ToolRegistry` yet.
+Unlike `get_vector_store()`/`get_conversation_store()`, `get_tool_registry()` does **not**
+return a process-wide singleton: nothing ever writes through `FakeBusinessServiceClient` after
+construction, so unlike Step 12's `InMemoryVectorStore` bug, there is no state a later call
+could fail to see - a fresh registry per call is simply harmless here.
+
+**LLM integration boundary - deliberately not built.** The existing `LLMProvider.generate_reply(message: str) -> str`
+Protocol was not changed. Supporting real function-calling would need a richer contract (a way
+to pass tool definitions to the model and receive back which tool it wants called, with what
+arguments) that no current caller needs yet. Changing `LLMProvider` now, with nothing to
+exercise the new shape, would be exactly the kind of premature abstraction this codebase has
+consistently avoided (see Engineering principles). The target flow this step sets up for -
+`User → Agent → LLM decides whether a tool is needed → ToolRegistry → Tool →
+BusinessServiceClient → NestJS Business API` - is a later step's job.
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -654,10 +780,14 @@ when one exists, would need hiding for different reasons than a UUID already sat
 - [x] Chat API integration (`POST /api/v1/chat` connected to the full RAG pipeline)
 - [x] Conversation context foundation (`ConversationStore`, bounded recent-message window,
       multi-turn `/api/v1/chat` - in-memory only, single-process)
+- [x] Tool capability boundary (`Tool`, `ToolMetadata`, `ToolRegistry`,
+      `check_vehicle_availability`, `BusinessServiceClient` - fake implementation only)
 - [ ] PostgreSQL-backed conversation persistence
 - [ ] Long-term/semantic conversation memory, summarization, query rewriting for follow-ups
-- [ ] Car-rental tools / function calling
+- [ ] Real NestJS Business API integration (HTTP `BusinessServiceClient`)
+- [ ] LLM tool/function calling (the LLM deciding when to invoke a tool)
 - [ ] Agent orchestration / autonomous planning
+- [ ] Booking creation, modification, or cancellation
 - [ ] Q&A evaluation/improvement loop
 - [ ] Streaming, reranking, hybrid search
 - [ ] Authentication, business/rental database integration
@@ -670,12 +800,15 @@ when one exists, would need hiding for different reasons than a UUID already sat
   manual container or global state.
 - **Provider boundaries** — external systems (LLM SDKs, PDF libraries) sit behind a Protocol
   defined by the application layer, never imported by the code that consumes them.
-- **Framework-independent knowledge, RAG, and conversation layers** — none of `app/knowledge`,
-  `app/rag`, or `app/conversation` has a FastAPI dependency, so all three are usable (and
-  testable) outside a request/response cycle.
+- **Framework-independent knowledge, RAG, conversation, and tools layers** — none of
+  `app/knowledge`, `app/rag`, `app/conversation`, or `app/tools` has a FastAPI dependency, so
+  all four are usable (and testable) outside a request/response cycle.
 - **Separate domains stay separate** — the knowledge base (car-rental facts, embeddings, vector
-  search) and conversation memory (dialogue identity, ordering, history) share no model, table,
-  or store, even though both now feed the same `AnswerGenerator` prompt.
+  search), conversation memory (dialogue identity, ordering, history), and tools (dynamic
+  business operations, owned by the business backend) share no model, table, or store.
+- **Integration boundaries aren't business-domain owners** — `app/tools` describes and invokes
+  business operations; it holds no rental inventory, booking state, customer records,
+  authentication, or pricing rules. That data stays owned by the (future) NestJS Business API.
 - **Testability** — every provider boundary has a fake/mocked counterpart so the full test
   suite runs with no network access and no API keys.
 - **No leaking internal failures to the client** — provider/storage exceptions are already
