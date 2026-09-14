@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.39",
     "pydantic-settings>=2.11",
     "python-dotenv>=1.2",
+    "openai>=2.48",
 ]
 
 [project.optional-dependencies]

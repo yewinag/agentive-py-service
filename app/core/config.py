@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -21,8 +22,13 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # Selects the LLMProvider implementation in app/llm/dependencies.py.
-    # Only "fake" exists today; a real provider adds another accepted value.
+    # One of: "fake", "openai".
     llm_provider: str = "fake"
+
+    # Required only when llm_provider == "openai". No default on purpose -
+    # a missing key must fail loudly rather than silently falling back.
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-4o-mini"
 
 
 @lru_cache
