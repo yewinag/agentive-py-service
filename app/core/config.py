@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     environment: str = "development"
     debug: bool = False
 
+    # Selects the LLMProvider implementation in app/llm/dependencies.py.
+    # Only "fake" exists today; a real provider adds another accepted value.
+    llm_provider: str = "fake"
+
 
 @lru_cache
 def get_settings() -> Settings:
