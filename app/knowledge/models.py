@@ -4,9 +4,11 @@ from pydantic import BaseModel, Field
 class DocumentSource(BaseModel):
     """A raw, not-yet-extracted document entering the pipeline.
 
-    Today `content` models fake, already-textual input. A real source
-    (a PDF's bytes, a file path) will likely change this field's type,
-    but ExtractedDocument/DocumentChunk downstream won't need to change.
+    `content` is interpreted by whichever DocumentExtractor consumes it:
+    FakeDocumentExtractor treats it as literal inline text;
+    PdfDocumentExtractor treats it as a filesystem path to a PDF. A
+    plain str turns out to be enough for both cases (a path is still a
+    string), so the field's shape didn't need to change to support PDFs.
     """
 
     id: str = Field(..., min_length=1)
@@ -20,6 +22,7 @@ class ExtractedDocument(BaseModel):
     document_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
     text: str = Field(..., min_length=1)
+    page_count: int = Field(default=1, ge=1)
 
 
 class DocumentChunk(BaseModel):
