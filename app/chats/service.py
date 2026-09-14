@@ -3,10 +3,10 @@ from typing import Optional
 from fastapi import Depends
 from pydantic import BaseModel
 
+from app.agent.service import AgentService, get_agent_service
 from app.conversation.models import Conversation, ConversationMessage
 from app.conversation.store import ConversationStore, get_conversation_store
 from app.core.config import Settings, get_settings
-from app.rag.answer_generator import AnswerGenerator, get_answer_generator
 from app.rag.models import GroundedAnswer
 
 
@@ -22,19 +22,24 @@ class ChatResult(BaseModel):
 
 class ChatService:
     """Chat application logic. Coordinates a ConversationStore (which
-    conversation, its recent history) and an AnswerGenerator (retrieval +
-    grounded generation) for one request - it knows WHAT it needs from
-    each, never HOW retrieval, embeddings, vector search, the LLM SDK, or
-    conversation persistence work.
+    conversation, its recent history) and an AgentService (retrieval +
+    bounded tool-calling + grounded generation) for one request - it
+    knows WHAT it needs from each, never HOW retrieval, embeddings,
+    vector search, tool execution, the LLM SDK, or conversation
+    persistence work. As of Step 15, delegates to AgentService rather
+    than AnswerGenerator directly - AgentService is a strict superset of
+    AnswerGenerator's capability (see app/agent/service.py), and its
+    result type (GroundedAnswer) is identical, so this is the only line
+    that changed here.
     """
 
     def __init__(
         self,
-        answer_generator: AnswerGenerator,
+        agent_service: AgentService,
         conversation_store: ConversationStore,
         history_window: int,
     ) -> None:
-        self._answer_generator = answer_generator
+        self._agent_service = agent_service
         self._conversation_store = conversation_store
         self._history_window = history_window
 
@@ -46,7 +51,7 @@ class ChatService:
             conversation.id, limit=self._history_window
         )
 
-        answer = await self._answer_generator.answer(message, history=history)
+        answer = await self._agent_service.answer(message, history=history)
 
         await self._conversation_store.append_message(
             conversation.id, ConversationMessage(role="user", content=message)
@@ -70,14 +75,14 @@ class ChatService:
 
 
 def get_chat_service(settings: Settings = Depends(get_settings)) -> ChatService:
-    """FastAPI is now a real consumer of both the RAG and conversation
+    """FastAPI is now a real consumer of the agent, RAG, and conversation
     composition chains, so this is the one place that bridges from
-    Depends()-resolved Settings to get_answer_generator()/
+    Depends()-resolved Settings to get_agent_service()/
     get_conversation_store() - the plain, framework-independent
     composition functions everything else is still built through.
     """
     return ChatService(
-        answer_generator=get_answer_generator(settings),
+        agent_service=get_agent_service(settings),
         conversation_store=get_conversation_store(settings),
         history_window=settings.conversation_history_window,
     )

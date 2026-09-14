@@ -3,8 +3,9 @@ conversation architecture, using only in-process fakes:
 
     FakeDocumentExtractor -> SectionAwareChunker -> FakeEmbeddingProvider
     -> InMemoryVectorStore -> Retriever -> FakeLLMProvider
-    -> AnswerGenerator -> InMemoryConversationStore -> ChatService
-    -> FastAPI /api/v1/chat
+    -> AgentService (empty ToolRegistry - no tool involved here, see
+    test_chat_tool_calling_integration.py for that) -> InMemoryConversationStore
+    -> ChatService -> FastAPI /api/v1/chat
 
 No real OpenAI call, no PostgreSQL requirement. The composed ChatService
 is injected via app.dependency_overrides[get_chat_service] - the one
@@ -14,6 +15,7 @@ underlying providers stay deterministic.
 """
 import asyncio
 
+from app.agent.service import AgentService
 from app.chats.service import ChatService, get_chat_service
 from app.conversation.in_memory_store import InMemoryConversationStore
 from app.knowledge.chunking import SectionAwareChunker
@@ -25,7 +27,8 @@ from app.knowledge.models import DocumentSource
 from app.knowledge.retriever import VectorRetriever
 from app.llm.fake_provider import FakeLLMProvider
 from app.main import app
-from app.rag.answer_generator import NOT_AVAILABLE_ANSWER, AnswerGenerator
+from app.rag.answer_generator import NOT_AVAILABLE_ANSWER
+from app.tools.registry import ToolRegistry
 
 POLICY_TEXT = (
     "1. Driver Eligibility & Required Documents\n"
@@ -47,7 +50,7 @@ async def _build_chat_service_with_ingested_knowledge(history_window: int = 6) -
     )
     retriever = VectorRetriever(embedding_provider, vector_store)
     return ChatService(
-        AnswerGenerator(retriever, FakeLLMProvider()),
+        AgentService(retriever, FakeLLMProvider(), ToolRegistry()),
         InMemoryConversationStore(),
         history_window=history_window,
     )
@@ -58,7 +61,7 @@ def _build_chat_service_with_empty_knowledge() -> ChatService:
     vector_store = InMemoryVectorStore()  # nothing ingested
     retriever = VectorRetriever(embedding_provider, vector_store)
     return ChatService(
-        AnswerGenerator(retriever, FakeLLMProvider()),
+        AgentService(retriever, FakeLLMProvider(), ToolRegistry()),
         InMemoryConversationStore(),
         history_window=6,
     )

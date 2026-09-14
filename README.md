@@ -13,36 +13,45 @@ Frontend
 Main Business API
   ↓
 FastAPI Agentive Service
-  ├── Chat                      (app/chats)
-  ├── Conversation Memory         (app/conversation)
-  ├── RAG / Answering               (app/rag)
-  ├── Tools                           (app/tools)  →  (future) NestJS Business API
-  ├── LLM Provider                       (app/llm)
-  └── Knowledge Pipeline                   (app/knowledge)
+  ├── Chat                          (app/chats)
+  ├── Agent / Orchestration           (app/agent)
+  ├── Conversation Memory               (app/conversation)
+  ├── RAG / Answering                     (app/rag)
+  ├── Tools                                 (app/tools)  →  (future) NestJS Business API
+  ├── LLM Provider                             (app/llm)
+  └── Knowledge Pipeline                          (app/knowledge)
 ```
 
-Six boundaries, each with a single responsibility:
+Seven boundaries, each with a single responsibility:
 
 - **Chat/application layer** (`app/chats`) — orchestrates one HTTP request: validates input,
-  resolves/continues a conversation, delegates to `AnswerGenerator` via `ChatService`, shapes
-  the response. `POST /api/v1/chat` returns a knowledge-grounded, multi-turn-aware answer. Not
-  yet connected to `app/tools` - see Tools section for why.
+  resolves/continues a conversation, delegates to `AgentService` via `ChatService`, shapes the
+  response. `POST /api/v1/chat` returns a knowledge-grounded, tool-assisted, multi-turn-aware
+  answer - the caller never sees whether a tool was involved.
+- **Agent/orchestration layer** (`app/agent`) — the new capability this step adds: offers
+  available tools to the LLM alongside retrieved knowledge, executes at most one bounded round
+  of tool calls it requests, and returns a final grounded answer, behind `AgentService`. Depends
+  on `Retriever`, `LLMProvider`, and `ToolRegistry` - reuses `AnswerGenerator`'s prompt-building
+  helpers rather than duplicating them (see Agent / tool calling section below).
 - **Conversation memory layer** (`app/conversation`) — a domain deliberately separate from the
-  knowledge base (see Conversation context section below): identity, ordering, and bounded
-  recent-history for a conversation, behind `ConversationStore`. Holds no car-rental knowledge,
-  no embeddings, no vectors.
+  knowledge base and from tools (see Conversation context section below): identity, ordering,
+  and bounded recent-history for a conversation, behind `ConversationStore`. Holds no car-rental
+  knowledge, no embeddings, no vectors, no tool-call structures.
 - **RAG / grounded-answering layer** (`app/rag`) — combines retrieval, bounded conversation
   context, and LLM generation into one grounded answer, behind `AnswerGenerator`. Depends on
-  the `Retriever` and `LLMProvider` Protocols only. `ChatService` is its one real consumer.
+  the `Retriever` and `LLMProvider` Protocols only. Still fully working and tested; `AgentService`
+  is now `ChatService`'s actual dependency (a strict superset of this capability) - see Agent /
+  tool calling section for why `AnswerGenerator` wasn't modified or removed.
 - **Tools layer** (`app/tools`) — a domain deliberately separate from both the knowledge base
   and the business backend itself (see Tools section below): describes and executes dynamic
   business operations (today: vehicle availability) behind a `Tool` Protocol and a
   `ToolRegistry`, talking to the business system through a `BusinessServiceClient` Protocol.
   Owns no rental inventory, booking state, or customer data - it's an integration boundary, not
-  a business-domain owner. Not yet connected to any LLM/agent decision loop or any endpoint.
-- **LLM provider layer** (`app/llm`) — answers "how do we generate a reply?" behind an
-  `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
-  is swappable without touching the chat, conversation, RAG, or tools layers.
+  a business-domain owner. `AgentService` is its first real consumer.
+- **LLM provider layer** (`app/llm`) — answers "how do we generate a reply, optionally offering
+  tools?" behind an `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or
+  anything else later) is swappable without touching the chat, agent, conversation, RAG, or
+  tools layers.
 - **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
   embeddable, storable, and searchable units: extraction (`DocumentExtractor`), chunking
   (`DocumentChunker`), embedding (`EmbeddingProvider`), vector storage (`VectorStore`),
@@ -86,6 +95,13 @@ Six boundaries, each with a single responsibility:
 - `BusinessServiceClient` Protocol, with a fake/deterministic implementation
 - One concrete tool: `check_vehicle_availability` (dynamic availability lookup, validated
   input, distinguishing input/business-service/execution failures)
+- Provider-agnostic tool calling: `LLMProvider.generate()` accepts tools and returns either
+  final text or a structured tool-call request, expressed entirely in application-level models
+  (`LLMRequest`, `LLMResponse`, `LLMMessage`, `ToolCall`) - no OpenAI SDK type ever leaves
+  `app/llm/openai_provider.py`
+- `AgentService`: offers `check_vehicle_availability` to the LLM, executes it if requested
+  (bounded to exactly one round), and returns a final grounded answer - `ChatService`'s actual
+  dependency for `POST /api/v1/chat` as of this step
 - Unit/integration tests
 
 **Not implemented yet:**
@@ -93,9 +109,9 @@ Six boundaries, each with a single responsibility:
   yet - see Conversation context section for why)
 - Long-term/semantic conversation memory, summarization, or query rewriting for follow-ups
 - Real NestJS Business API integration (no HTTP `BusinessServiceClient` yet - see Tools section)
-- LLM tool/function calling - the LLM cannot invoke a tool yet; `ToolRegistry` exists, nothing
-  decides when to use it
-- Agent orchestration / autonomous planning
+- More than one tool-call round, parallel tool execution, or multiple registered tools beyond
+  `check_vehicle_availability`
+- Autonomous planning / multi-agent systems
 - Booking creation, modification, or cancellation of any kind
 - Q&A evaluation/improvement loop
 - Streaming, reranking, hybrid search
@@ -106,16 +122,17 @@ Six boundaries, each with a single responsibility:
 
 ```
 app/
-├── api/            # Router aggregation + shared exception handlers
-├── chats/           # Chat feature: router, schemas, ChatService (-> AnswerGenerator + ConversationStore)
-├── conversation/     # Conversation, ConversationMessage, ConversationStore Protocol + in-memory impl
-├── core/             # Cross-cutting config (Settings)
-├── health/           # Health-check endpoint
-├── knowledge/         # Document contracts, extraction, chunking, embedding, storage,
-│                       # retrieval, ingestion orchestration, and startup bootstrap
-├── llm/               # LLMProvider Protocol + fake/OpenAI implementations
-├── rag/                # AnswerGenerator: Retriever + LLMProvider + history -> grounded answer
-└── tools/               # Tool/ToolRegistry, BusinessServiceClient, check_vehicle_availability
+├── agent/            # AgentService: Retriever + LLMProvider + ToolRegistry -> grounded answer
+├── api/                # Router aggregation + shared exception handlers
+├── chats/               # Chat feature: router, schemas, ChatService (-> AgentService + ConversationStore)
+├── conversation/         # Conversation, ConversationMessage, ConversationStore Protocol + in-memory impl
+├── core/                 # Cross-cutting config (Settings)
+├── health/               # Health-check endpoint
+├── knowledge/            # Document contracts, extraction, chunking, embedding, storage,
+│                         # retrieval, ingestion orchestration, and startup bootstrap
+├── llm/                  # LLMProvider Protocol, provider-agnostic models, fake/OpenAI implementations
+├── rag/                  # AnswerGenerator: Retriever + LLMProvider + history -> grounded answer (no tools)
+└── tools/                # Tool/ToolRegistry, BusinessServiceClient, check_vehicle_availability
 
 tests/                # Mirrors the app/ layout, one test package per feature
 data/
@@ -139,16 +156,18 @@ EmbeddingProvider       →  embedding vector[]
 VectorStore              →  persisted, searchable chunks
 ```
 
-**Retrieval + RAG + conversation context, reachable via `POST /api/v1/chat`:**
+**Retrieval + RAG + tools + conversation context, reachable via `POST /api/v1/chat`:**
 ```
 user message + optional conversation_id
   ↓
 ChatService  →  ConversationStore  (resolve conversation, load bounded recent history)
   ↓
-AnswerGenerator  →  Retriever  →  EmbeddingProvider  →  VectorStore.search()
+AgentService  →  Retriever  →  EmbeddingProvider  →  VectorStore.search()
   ↓                                      ↓
-LLMProvider.generate_reply()   ranked VectorSearchResult[]
-  (prompt = grounding + history + knowledge context + question)
+LLMProvider.generate()          ranked VectorSearchResult[]
+  ├── final text  ──────────────────────────────────────────────┐
+  └── tool call → ToolRegistry → Tool → BusinessServiceClient    │
+        → result fed back → LLMProvider.generate() (no tools) ───┘
   ↓
 ChatService  →  ConversationStore  (append user + assistant messages)
   ↓
@@ -157,8 +176,9 @@ ChatResponse { reply, sources[], conversation_id }
 
 Every stage is implemented, tested, and wired end to end. Ingestion still has no HTTP
 trigger - the default in-memory store is populated by an explicit startup bootstrap instead
-(see Chat API integration below). Tools, agent orchestration, conversation summarization, and
-durable (cross-process) conversation persistence remain future work.
+(see Chat API integration below). Real NestJS integration, autonomous/multi-round agent
+planning, conversation summarization, and durable (cross-process) conversation persistence
+remain future work.
 
 The two PDFs in `data/knowledge/` (`car-rental-services.pdf`, `car-rental-policies.pdf`) are
 the car-rental knowledge sources this pipeline is built, tested, and (by default) bootstrapped
@@ -167,17 +187,19 @@ around.
 ## LLM provider architecture
 
 ```
-AnswerGenerator
-  ↓
-LLMProvider (Protocol)
-  ↑
-FakeLLMProvider / OpenAIProvider
+AnswerGenerator (no tools)   AgentService (offers tools)
+          ↓                           ↓
+          └──────────→ LLMProvider (Protocol) ←──────────┘
+                              ↑
+                  FakeLLMProvider / OpenAIProvider
 ```
 
-As of Step 12, `ChatService` no longer talks to `LLMProvider` directly - it delegates to
-`AnswerGenerator`, which is the layer that depends on the `LLMProvider` Protocol. Provider-specific
-logic (the OpenAI SDK, its exceptions) stays isolated inside `app/llm/openai_provider.py` —
-nothing outside that one file imports the SDK, and this didn't change when chat got wired to RAG.
+`ChatService` doesn't talk to `LLMProvider` directly (since Step 12) - it delegates to
+`AgentService` (since Step 15), which is one of two layers that now depend on the `LLMProvider`
+Protocol; `AnswerGenerator` still depends on it too, unchanged. Provider-specific logic (the
+OpenAI SDK, its exceptions, and - new in Step 15 - all translation to/from its tool-calling
+format) stays isolated inside `app/llm/openai_provider.py` — nothing outside that one file
+imports the SDK. See Agent / tool calling below for how `LLMProvider` itself evolved this step.
 
 ## Local development
 
@@ -192,9 +214,11 @@ fastapi dev app/main.py
 Available endpoints:
 - `GET /health` — service health check
 - `GET /docs` — interactive Swagger UI
-- `POST /api/v1/chat` — returns a knowledge-grounded, multi-turn-aware answer, by default drawn
-  from the two PDFs bootstrapped into the in-memory store at startup (see Chat API integration
-  and Conversation context below)
+- `POST /api/v1/chat` — returns a knowledge-grounded, tool-assisted, multi-turn-aware answer, by
+  default drawn from the two PDFs bootstrapped into the in-memory store at startup (see Chat API
+  integration, Conversation context, and Agent / tool calling below). The response never
+  reveals whether a tool was used - the contract stays `reply`/`sources`/`conversation_id`
+  either way.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/chat \
@@ -256,12 +280,16 @@ BUSINESS_SERVICE_PROVIDER=fake       # only "fake" is implemented today - see To
 values, is tracked.
 
 Ingestion and wiring chat to RAG needed no new settings. Step 13 added
-`conversation_store_provider`/`conversation_history_window`; Step 14 adds
-`business_service_provider`, the same shape again - a provider selector kept even with only one
-working value today, so a real NestJS-calling client slots in later without touching any tool.
-The grounding system prompt remains a fixed code constant, not a setting - it's not something
-that should vary by environment, and making it configurable would just be a place for
-inconsistent/untested prompt variants to creep in.
+`conversation_store_provider`/`conversation_history_window`; Step 14 added
+`business_service_provider`. Step 15 adds **no new settings at all**: `AgentService` is built
+from the same `get_retriever()`/`get_llm_provider()`/`get_tool_registry()` composition
+functions every other layer already uses. The one-tool-call-round bound
+(`MAX_TOOL_ROUNDS` in `app/agent/service.py`) is deliberately a code constant, not a setting -
+unlike `retrieval_top_k` or `conversation_history_window` (genuine operational tuning knobs,
+safe to default without usage data), this bound is a scoped safety constraint for this step
+(see Scope restrictions), and making it configurable would let it be silently raised past what
+this step was actually built and tested for. The grounding system prompt remains a fixed code
+constant too, for the same reason as always - not something that should vary by environment.
 
 ## Testing
 
@@ -279,33 +307,42 @@ provider-selection/config-failure behavior), the retrieval layer (orchestration 
 stub providers/stores, plus a deterministic end-to-end test using the real
 `FakeEmbeddingProvider` + `InMemoryVectorStore`), `IngestionService` (fake-provider unit tests
 plus an integration test processing the two real PDFs through the real extractor/chunker), and
-`AnswerGenerator` (orchestration tests with stub `Retriever`/`LLMProvider`, plus a full
-end-to-end test chaining `FakeDocumentExtractor → SectionAwareChunker → FakeEmbeddingProvider →
-InMemoryVectorStore → Retriever → FakeLLMProvider`), the startup bootstrap (`bootstrap_default_knowledge_base`,
-called directly - no FastAPI/lifespan involved), and the wired `/api/v1/chat` endpoint itself:
-router-level tests (stubbed `ChatService`, proving the router only depends on
-`get_chat_service()`'s abstraction), a full HTTP round-trip test chaining
-`FakeDocumentExtractor → SectionAwareChunker → FakeEmbeddingProvider → InMemoryVectorStore →
-Retriever → FakeLLMProvider → AnswerGenerator → InMemoryConversationStore → ChatService →` the
-real FastAPI app - including a two-request test proving a follow-up's prompt genuinely contains
-the prior turn's exact question, not just that something was stored - and a parametrized test
-confirming embedding/vector-store/LLM failures all return a clean 503 with no provider-specific
-detail in the body. `ConversationStore` has its own dedicated coverage: creating a conversation,
-appending messages in order, a bounded recent-message window (oldest-first, correctly truncated
-and correctly returning everything when there's less than the limit), a missing conversation id
-(`get()` returns `None`; `append_message`/`get_recent_messages` raise
-`ConversationNotFoundError`), and isolation between two unrelated conversations.
-`ChatService` itself has unit-level orchestration tests (stub `AnswerGenerator`, real
-`InMemoryConversationStore`) proving a new chat creates a conversation, a follow-up reuses it,
-both turns get appended, prior turns are actually passed as `history` to `AnswerGenerator`, an
-unknown `conversation_id` falls back to a new conversation rather than erroring, and the
-history window is respected. The tool boundary has its own coverage too: `ToolRegistry`
+`AnswerGenerator` (still fully covered exactly as in Step 11/13 - a stub `LLMProvider` and
+directly-tested `build_context`/`build_history_block`/`build_prompt`, plus a full end-to-end
+test chaining `FakeDocumentExtractor → SectionAwareChunker → FakeEmbeddingProvider →
+InMemoryVectorStore → Retriever → FakeLLMProvider`), the startup bootstrap
+(`bootstrap_default_knowledge_base`, called directly - no FastAPI/lifespan involved), and the
+wired `/api/v1/chat` endpoint itself: router-level tests (stubbed `ChatService`, proving the
+router only depends on `get_chat_service()`'s abstraction), a full HTTP round-trip test
+chaining fakes through `AgentService → InMemoryConversationStore → ChatService →` the real
+FastAPI app - including a two-request test proving a follow-up's prompt genuinely contains the
+prior turn's exact question - and a parametrized test confirming embedding/vector-store/LLM
+failures all return a clean 503 with no provider-specific detail in the body. `ConversationStore`
+has its own dedicated coverage: creating a conversation, appending messages in order, a bounded
+recent-message window, a missing conversation id (`get()` returns `None`;
+`append_message`/`get_recent_messages` raise `ConversationNotFoundError`), and isolation between
+two unrelated conversations. The tool boundary has its own coverage too: `ToolRegistry`
 (register, resolve, list, unknown-name lookup, duplicate-registration rejection), the metadata/
 input-schema/valid-execution/invalid-input/error-propagation contract for
 `CheckVehicleAvailabilityTool`, `FakeBusinessServiceClient`'s deterministic date-range/category
-filtering, provider-selection composition tests, and an integration test chaining
-`FakeBusinessServiceClient → CheckVehicleAvailabilityTool → ToolRegistry`. All of the above run
-without any external network access, API key, or database.
+filtering, and provider-selection composition tests.
+
+Step 15 (provider-agnostic tool calling) added: `LLMMessage`/`LLMRequest`/`LLMResponse`/
+`ToolCall` model tests; `FakeLLMProvider`'s two modes (default single-call echo, and a
+configured response sequence for scripting tool-call-then-final-answer flows); `OpenAIProvider`
+tests with a mocked SDK client verifying tool-metadata-to-OpenAI-format conversion, tool-call
+parsing from the response, correct re-translation of a prior assistant tool-call + tool-result
+turn for the follow-up request, and malformed-arguments handling; and `AgentService`'s own
+orchestration tests - final answer returned directly, a tool call executed and its result fed
+back to the model, tools omitted (not just declined) on the bounded follow-up call, unknown
+tool/invalid arguments/business-service failure/tool execution failure each handled gracefully
+without aborting the request, LLM failures on either call propagating, and the one-round policy
+enforced even against a misbehaving provider that ignores the empty `tools` list. Two further
+integration tests chain the real `CheckVehicleAvailabilityTool` + `FakeBusinessServiceClient`
+through `AgentService`, and one chains the whole stack through the real FastAPI app via
+`POST /api/v1/chat`, proving a tool-assisted answer end to end with the public response
+contract (`reply`/`sources`/`conversation_id`) unchanged. All of the above run without any
+external network access, API key, or database.
 
 A separate `tests/knowledge/test_pgvector_store_integration.py` exercises `PgVectorStore`
 against a real PostgreSQL+pgvector instance; it's skipped automatically unless `DATABASE_URL`
@@ -486,16 +523,20 @@ AnswerGenerator (Protocol-free, like ChatService)
   ├── build_context()        →  deterministic text block: document title + section heading + chunk text
   ├── build_history_block()   →  deterministic text block: prior conversation turns (may be empty)
   ├── build_prompt()           →  grounding instructions + history? + context + question
-  └── LLMProvider.generate_reply(prompt)  →  answer
+  └── LLMProvider.generate(LLMRequest(messages=[...]))  →  LLMResponse.text
                     ↓
 GroundedAnswer { answer, sources[] }
 ```
 
 - **`AnswerGenerator`** (`app/rag/answer_generator.py`) depends only on the `Retriever` and
-  `LLMProvider` Protocols - never OpenAI, pgvector, ConversationStore, or FastAPI directly. It
-  has no Protocol of its own: like `ChatService`, it's application orchestration logic with
-  exactly one real implementation, not an external boundary with swappable backends -
-  testability already comes from `Retriever`/`LLMProvider` each being fakeable.
+  `LLMProvider` Protocols - never OpenAI, pgvector, ConversationStore, ToolRegistry, or FastAPI
+  directly. It has no Protocol of its own: like `ChatService`, it's application orchestration
+  logic with exactly one real implementation, not an external boundary with swappable backends -
+  testability already comes from `Retriever`/`LLMProvider` each being fakeable. Unchanged in
+  behavior by Step 15's `LLMProvider.generate()` evolution: it never sets `LLMRequest.tools`, so
+  its one LLM call can never receive a tool-call response back - see Agent / tool calling for
+  why `AgentService`, not `AnswerGenerator`, is what actually offers tools, and why
+  `AnswerGenerator` was reused rather than modified or removed.
 - **Context construction** (`build_context`) is a small, pure, directly-tested function. It
   includes only `document_title`, `section_heading`, and `text` per retrieved chunk - not
   `score`/`id`/`position`, which mean nothing to the model and would just be prompt noise.
@@ -512,9 +553,10 @@ GroundedAnswer { answer, sources[] }
   invent policies/prices/requirements/availability, and say so explicitly when the context is
   insufficient - plus one more sentence added in Step 13: conversation history is for
   understanding what's already been discussed, never a source of policies/prices/requirements/
-  availability itself, only the knowledge context is. `LLMProvider.generate_reply()` still
-  takes one plain string, unchanged since Step 3/4 - grounding instructions, history, context,
-  and question are all composed into that single string by `build_prompt()`.
+  availability itself, only the knowledge context is. The composed string
+  (grounding instructions + history + context + question, built by `build_prompt()`) still
+  becomes a single `LLMMessage` - Step 15 changed how that message reaches the model
+  (`LLMProvider.generate()` instead of the retired `generate_reply()`), not what's in it.
 - **Empty retrieval**: if `Retriever.retrieve()` returns no results, `AnswerGenerator` returns
   a fixed `NOT_AVAILABLE_ANSWER` and **never calls the LLM** - tested explicitly. The
   application layer decides "we have nothing relevant," not the model.
@@ -538,21 +580,25 @@ ChatRequest { message, conversation_id? } (validated)
   ↓
 ChatService.get_reply()  →  ConversationStore.get/create + get_recent_messages
   ↓
-AnswerGenerator.answer(message, history)  →  GroundedAnswer { answer, sources[] }
+AgentService.answer(message, history)  →  GroundedAnswer { answer, sources[] }
+  (internally: retrieval, up to one bounded tool-call round, final LLM call - see
+  Agent / tool calling below)
   ↓
 ChatService  →  ConversationStore.append_message() x2 (user, then assistant)
   ↓
 ChatResponse { reply, sources[], conversation_id }
 ```
 
-- **`ChatService`** (`app/chats/service.py`) now holds an `AnswerGenerator` *and* a
+- **`ChatService`** (`app/chats/service.py`) now holds an `AgentService` *and* a
   `ConversationStore` - it knows WHAT it needs (an answer to a message, in the context of a
-  conversation), never that retrieval, embeddings, vector search, an LLM SDK, or conversation
-  persistence are involved. `get_chat_service()` is the one FastAPI-`Depends()`-wired seam in
-  this whole chain: it resolves `Settings` via `Depends(get_settings)`, then calls the plain
-  `get_answer_generator(settings)`/`get_conversation_store(settings)` composition functions -
+  conversation), never that retrieval, embeddings, vector search, tool execution, an LLM SDK, or
+  conversation persistence are involved. `get_chat_service()` is the one FastAPI-`Depends()`-wired
+  seam in this whole chain: it resolves `Settings` via `Depends(get_settings)`, then calls the
+  plain `get_agent_service(settings)`/`get_conversation_store(settings)` composition functions -
   the same bridge pattern every other layer's composition function already documented as its
-  own eventual FastAPI entry point.
+  own eventual FastAPI entry point. `AgentService`'s result type (`GroundedAnswer`) is identical
+  to what `AnswerGenerator` returned, so this was the only real change `ChatService` needed for
+  Step 15.
 - **Request/response contract** (see Conversation context section for the full decision):
   `ChatRequest` gained an optional `conversation_id`; `ChatResponse` gained
   `conversation_id: str` alongside the existing `reply: str` and `sources: list[AnswerSource]`
@@ -686,12 +732,12 @@ explicitly an **integration boundary**, not a business-domain owner - it holds n
 inventory, no booking state, no customer records, no authentication, no authorization, no
 pricing rules. All of that belongs to the business backend, today represented only by a fake.
 
-**Scope decision - established the boundary, not the agent.** Built: `Tool` Protocol,
+**Scope (Step 14): established the boundary, not the agent.** Built: `Tool` Protocol,
 `ToolMetadata`, `ToolRegistry`, one concrete tool (`check_vehicle_availability`),
-`BusinessServiceClient` Protocol + `FakeBusinessServiceClient`, and tests proving all of it.
-Not built: an autonomous agent loop, LLM tool/function calling, or the real NestJS HTTP client -
-each explained below, deliberately deferred rather than a general-purpose agent framework built
-prematurely.
+`BusinessServiceClient` Protocol + `FakeBusinessServiceClient`, and tests proving all of it. Not
+built then: LLM tool/function calling or the real NestJS HTTP client. Step 15 (see Agent / tool
+calling below) built the former - a bounded, provider-agnostic tool-calling agent - while
+deliberately still not building the latter or an unrestricted autonomous loop.
 
 **`Tool` Protocol** (`app/tools/tool.py`): `metadata: ToolMetadata` (name, description,
 `input_schema: dict`) and `async execute(raw_input: dict) -> BaseModel`. `execute` takes a
@@ -749,20 +795,172 @@ execution failure that is neither of the other two - not actively raised by
 two; kept in the hierarchy for a future tool that needs it).
 
 **Composition**: `get_business_service_client(settings)` and `get_tool_registry(settings)` are
-plain functions, not FastAPI `Depends()`-wired - no endpoint consumes a `ToolRegistry` yet.
-Unlike `get_vector_store()`/`get_conversation_store()`, `get_tool_registry()` does **not**
-return a process-wide singleton: nothing ever writes through `FakeBusinessServiceClient` after
-construction, so unlike Step 12's `InMemoryVectorStore` bug, there is no state a later call
-could fail to see - a fresh registry per call is simply harmless here.
+plain functions, not FastAPI `Depends()`-wired - `AgentService`'s own composition function
+(`get_agent_service()`) calls `get_tool_registry()` directly, the same plain-function-calling-
+plain-function pattern used throughout; no endpoint calls `get_tool_registry()` itself, only
+`get_chat_service()` does, transitively. Unlike `get_vector_store()`/`get_conversation_store()`,
+`get_tool_registry()` does **not** return a process-wide singleton: nothing ever writes through
+`FakeBusinessServiceClient` after construction, so unlike Step 12's `InMemoryVectorStore` bug,
+there is no state a later call could fail to see - a fresh registry per call is simply harmless
+here.
 
-**LLM integration boundary - deliberately not built.** The existing `LLMProvider.generate_reply(message: str) -> str`
-Protocol was not changed. Supporting real function-calling would need a richer contract (a way
-to pass tool definitions to the model and receive back which tool it wants called, with what
-arguments) that no current caller needs yet. Changing `LLMProvider` now, with nothing to
-exercise the new shape, would be exactly the kind of premature abstraction this codebase has
-consistently avoided (see Engineering principles). The target flow this step sets up for -
-`User → Agent → LLM decides whether a tool is needed → ToolRegistry → Tool →
-BusinessServiceClient → NestJS Business API` - is a later step's job.
+**LLM integration boundary - built this step.** Step 14 deliberately deferred this; Step 15 is
+where it happens. See the Agent / tool calling section below for the full design: how
+`LLMProvider` evolved, how `AgentService` uses `ToolRegistry` to offer and execute tools, and
+the bounded one-round policy that keeps this from becoming an unrestricted agent loop.
+
+## Agent / tool calling
+
+```
+User
+  ↓
+AgentService
+  ├── Retriever → knowledge context (unchanged from Step 11 - see Tool + RAG interaction below)
+  └── LLMProvider.generate(LLMRequest{messages, tools: ToolRegistry.list_tools()})
+        ├── LLMResponse{text}         → done, return it
+        └── LLMResponse{tool_calls}   → execute via ToolRegistry (bounded: exactly one round)
+                                          → LLMProvider.generate(..., tools=[])  → final text
+  ↓
+GroundedAnswer { answer, sources[] }
+```
+
+**Provider-agnostic LLM contract.** `LLMProvider.generate_reply(message: str) -> str` (Steps
+3-14) is **retired**, replaced by `generate(request: LLMRequest) -> LLMResponse`
+(`app/llm/provider.py`). One unambiguous contract was chosen over keeping both methods side by
+side: `AnswerGenerator`'s change was a single, behavior-preserving call-site update (build an
+`LLMRequest` with one user message, read `.text` back - see RAG section), so there was no real
+case for carrying the old method forward as permanent legacy sugar. New application-level
+models (`app/llm/models.py`), none of them OpenAI-specific:
+
+```python
+class ToolCall(BaseModel):
+    id: str
+    tool_name: str
+    arguments: dict
+
+class LLMMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
+    tool_call_id: Optional[str] = None       # set on role == "tool": which ToolCall this answers
+    tool_calls: list[ToolCall] = []           # set on role == "assistant" when tools were requested
+
+class LLMRequest(BaseModel):
+    messages: list[LLMMessage]
+    tools: list[ToolMetadata] = []            # reused directly from app/tools - see below
+
+class LLMResponse(BaseModel):
+    text: Optional[str] = None
+    tool_calls: list[ToolCall] = []
+```
+
+`LLMRequest.tools` reuses `ToolMetadata` (Step 14) **directly** - not duplicated, not adapted
+into a parallel shape at this layer. `app/llm` importing from `app/tools` is a deliberate,
+narrow exception to this codebase's usual "layers don't depend sideways" instinct: `ToolMetadata`
+was explicitly designed in Step 14 to be "a provider-agnostic tool description a future
+LLM/function-calling layer can be given" - this is exactly that layer, and the alternative
+(a second, structurally-identical model plus a mapping function) would be pure duplication for
+no benefit. `LLMResponse` guarantees exactly one of `text`/`tool_calls` is meaningful - both
+`OpenAIProvider` and `FakeLLMProvider` uphold this, so `AgentService` never has to guess which
+one to trust.
+
+**`ToolCall`** is *not* the same thing as calling `Tool.execute()` directly - it's what the
+model said it wants, before anything has been validated or run. `ToolCall.arguments` maps 1:1
+onto `Tool.execute(raw_input: dict)`; there was no need for a second "pending call" wrapper
+type beyond that.
+
+**`AgentService`** (`app/agent/service.py`) is the new orchestration layer. It reuses
+`AnswerGenerator`'s `build_context`/`build_prompt`/`to_source`/`NOT_AVAILABLE_ANSWER` (`to_source`
+was made public - renamed from `_to_source` - specifically so this reuse wouldn't require
+duplicating it) rather than reimplementing prompt construction, but needs its **own** top-level
+method: tool-calling requires inspecting the LLM's response *before* deciding whether to return
+it or execute a tool and continue - something `AnswerGenerator.answer()`'s single,
+non-branching call cannot express, no matter how it's refactored, without giving it the same
+tool-awareness `AnswerGenerator` is deliberately kept free of. `AnswerGenerator` itself is
+**unchanged** and remains a fully working, directly usable, pure-RAG (no tool awareness)
+building block - not modified, not deleted, not bypassed in the sense of being made unreachable
+or untested; `ChatService` simply now depends on `AgentService` (a strict superset of its
+capability) instead, the same kind of evolution as Step 12 switching `ChatService` from
+`LLMProvider` to `AnswerGenerator`.
+
+**Bounded execution policy: exactly one tool-call round.** Not a counter compared against a
+configurable limit - a **structural** guarantee. If the model's first response requests tools,
+`AgentService` executes them, appends the results, and makes exactly one follow-up call with
+`tools=[]`: no tools offered at all, so the model cannot possibly request another one on that
+call - the bound is enforced by what the model is offered, not by trusting it to stop. If a
+follow-up response somehow still contains `tool_calls` anyway (only possible from a
+provider that doesn't honor an empty tools list), `AgentService` raises `LLMProviderError`
+rather than looping - failing loudly instead of silently allowing a second round. `1` is a
+code constant (`MAX_TOOL_ROUNDS` in `app/agent/service.py`), not a setting - see Configuration
+for why.
+
+**RAG + tool interaction.** Retrieval always runs first and is **never** skipped or replaced by
+a tool call - `AgentService.answer()` calls `Retriever.retrieve(question)` exactly like
+`AnswerGenerator` does, with the bare current question only (verified by
+`test_retrieval_is_called_with_only_the_current_question`). Both the retrieved knowledge context
+*and* the available tools are offered to the model in the same first call, so:
+- **Static knowledge** ("What is your cancellation policy?") → the model answers from the
+  knowledge context in the prompt; no tool call needed.
+- **Dynamic business data** ("Is a Camry available tomorrow?") → the model requests
+  `check_vehicle_availability`; the knowledge context is present but likely unused for that turn.
+- **Mixed requests** ("What is your cancellation policy, and is a Camry available tomorrow?") →
+  both are already available to the model in the same call (knowledge context from retrieval,
+  tool result once executed), so a reasonably capable model can address both without any extra
+  planning code on this service's side. No keyword matching, heuristics, or hand-coded routing
+  decide RAG-vs-tool in Python - that decision is the model's, made from the tool's own
+  description (see Tools section) and the retrieved context, exactly as real function-calling is
+  meant to work. Whether a given model actually does this well for a genuinely mixed request is
+  a model-quality question, not an architecture gap - no complex planning was built to compensate
+  for it, per this step's explicit scope.
+
+**`FakeLLMProvider`** (`app/llm/fake_provider.py`) gained a `responses` parameter: an explicit,
+ordered list of `LLMResponse` objects to return one per call (e.g. a tool-call response
+followed by a final-text response), never inferred or "smart" - popping a plain list. With no
+`responses` configured, it behaves exactly as before Step 15 (single-call echo of the most
+recent user message, `[fake-llm-reply] ...`), so every pre-existing test and default local-dev
+behavior is unaffected.
+
+**`OpenAIProvider`** (`app/llm/openai_provider.py`) is the only place the openai SDK's
+tool-calling types are ever touched. Verified against the actual installed SDK's type
+definitions (not assumed) before writing the translation:
+- `LLMRequest.tools` → OpenAI's `[{"type": "function", "function": {"name", "description",
+  "parameters"}}]`; omitted entirely (not sent as `tools=[]`) when no tools are offered,
+  preserving Step 3/4's original request shape exactly for that case.
+- A response's `message.tool_calls` → `list[ToolCall]`, parsing each `Function.arguments` JSON
+  string into a dict; malformed JSON is translated into `LLMProviderError`, never left to
+  surface as a raw `json.JSONDecodeError`.
+- A prior assistant tool-call turn and its tool-result turn are each translated back into
+  OpenAI's specific message shapes (`role: "assistant"` with a `tool_calls` array,
+  `role: "tool"` with `tool_call_id`) for the follow-up request - required for OpenAI's API to
+  accept the conversation at all, since a `"tool"`-role message must reference a preceding
+  assistant tool call by id.
+- `message.content is None` with no tool calls still raises `LLMProviderError`, unchanged from
+  Step 4.
+
+**Error handling.** `_execute_tool_call` in `AgentService` catches every case explicitly:
+unknown tool name (`ToolRegistry.resolve()` returns `None`), `ToolInputError`,
+`BusinessServiceUnavailableError`, and `ToolExecutionError` - each translated into a short,
+fixed, generic string (e.g. `"Error: the business service is currently unavailable."`) fed back
+to the model as the tool's result, **never** the raw exception message (which could contain a
+connection string or other internal detail). This lets the model produce a graceful final
+answer ("I couldn't check availability right now") instead of the whole request failing outright
+- more robust than treating every tool failure as fatal, and still fully safe: only a
+`ToolRegistry`-**resolved** tool's own `execute()` is ever called, so arbitrary model output can
+never execute arbitrary Python (see Tools section). `LLMProviderError` from the LLM call itself
+(as opposed to a tool) is **not** caught here - it propagates unwrapped, exactly like every
+other already-translated exception in this codebase, and is already mapped to a clean `503` by
+the existing `app/api/exception_handlers.py` handler from Step 12; no changes were needed there.
+Tool calls are **not** retried automatically anywhere in this flow.
+
+**Chat API impact - none, by design.** `ChatRequest`/`ChatResponse` are byte-for-byte unchanged
+from Step 13: `message`/`conversation_id` in, `reply`/`sources`/`conversation_id` out. A client
+cannot tell from the response whether a tool was used - no tool-call trace, no intermediate
+message list, no debug field, matching the requirement that tool use stays an internal
+implementation detail of producing "a final grounded answer." `ConversationMessage` (Step 13)
+is likewise **unchanged**: only the final user question and final assistant answer are ever
+persisted; the intermediate tool-call/tool-result exchange lives entirely inside
+`AgentService.answer()`'s local `messages: list[LLMMessage]` for that one request and is
+discarded once it returns - never written to `ConversationStore`, never given a new
+`ConversationMessage` role, exactly as scoped.
 
 ## Roadmap
 
@@ -782,11 +980,14 @@ BusinessServiceClient → NestJS Business API` - is a later step's job.
       multi-turn `/api/v1/chat` - in-memory only, single-process)
 - [x] Tool capability boundary (`Tool`, `ToolMetadata`, `ToolRegistry`,
       `check_vehicle_availability`, `BusinessServiceClient` - fake implementation only)
+- [x] Provider-agnostic tool calling / agent orchestration foundation (`AgentService`,
+      `LLMProvider.generate()`, bounded to exactly one tool-call round)
 - [ ] PostgreSQL-backed conversation persistence
 - [ ] Long-term/semantic conversation memory, summarization, query rewriting for follow-ups
 - [ ] Real NestJS Business API integration (HTTP `BusinessServiceClient`)
-- [ ] LLM tool/function calling (the LLM deciding when to invoke a tool)
-- [ ] Agent orchestration / autonomous planning
+- [ ] More than one tool-call round, parallel tool execution, additional tools beyond
+      `check_vehicle_availability`
+- [ ] Autonomous planning / multi-agent systems
 - [ ] Booking creation, modification, or cancellation
 - [ ] Q&A evaluation/improvement loop
 - [ ] Streaming, reranking, hybrid search
@@ -800,9 +1001,13 @@ BusinessServiceClient → NestJS Business API` - is a later step's job.
   manual container or global state.
 - **Provider boundaries** — external systems (LLM SDKs, PDF libraries) sit behind a Protocol
   defined by the application layer, never imported by the code that consumes them.
-- **Framework-independent knowledge, RAG, conversation, and tools layers** — none of
-  `app/knowledge`, `app/rag`, `app/conversation`, or `app/tools` has a FastAPI dependency, so
-  all four are usable (and testable) outside a request/response cycle.
+- **Framework-independent knowledge, RAG, conversation, tools, and agent layers** — none of
+  `app/knowledge`, `app/rag`, `app/conversation`, `app/tools`, or `app/agent` has a FastAPI
+  dependency, so all five are usable (and testable) outside a request/response cycle.
+- **Evolve a contract rather than duplicate it** — when `LLMProvider` needed to support tool
+  calls (Step 15), the old `generate_reply()` was retired in favor of one richer `generate()`
+  method, not kept alongside it as permanent legacy sugar. The one call site that used it
+  (`AnswerGenerator`) got a small, behavior-preserving update instead.
 - **Separate domains stay separate** — the knowledge base (car-rental facts, embeddings, vector
   search), conversation memory (dialogue identity, ordering, history), and tools (dynamic
   business operations, owned by the business backend) share no model, table, or store.

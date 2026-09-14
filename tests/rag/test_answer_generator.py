@@ -7,6 +7,7 @@ from app.knowledge.exceptions import EmbeddingProviderError, VectorStoreError
 from app.knowledge.models import DocumentChunk
 from app.knowledge.vector_store import VectorSearchResult
 from app.llm.exceptions import LLMProviderError
+from app.llm.models import LLMResponse
 from app.rag.answer_generator import (
     NOT_AVAILABLE_ANSWER,
     AnswerGenerator,
@@ -35,11 +36,12 @@ class StubLLMProvider:
         self._reply = reply
         self._error = error
 
-    async def generate_reply(self, message):
-        self.received_prompts.append(message)
+    async def generate(self, request):
+        prompt = request.messages[0].content
+        self.received_prompts.append(prompt)
         if self._error:
             raise self._error
-        return self._reply
+        return LLMResponse(text=self._reply)
 
 
 def _result(document_title: str, section_heading, text: str, score: float = 0.9) -> VectorSearchResult:

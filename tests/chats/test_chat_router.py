@@ -5,9 +5,9 @@ from app.rag.models import AnswerSource, GroundedAnswer
 
 class StubChatService:
     """Satisfies the shape ChatService/get_reply() offers, unrelated to
-    the real ChatService/AnswerGenerator/ConversationStore chain - proves
+    the real ChatService/AgentService/ConversationStore chain - proves
     the router depends on whatever get_chat_service() provides via
-    Depends(), not a hardcoded retrieval/RAG/conversation pipeline.
+    Depends(), not a hardcoded retrieval/RAG/tools/conversation pipeline.
     """
 
     def __init__(self, result: ChatResult) -> None:

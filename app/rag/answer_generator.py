@@ -4,6 +4,7 @@ from app.conversation.models import ConversationMessage
 from app.core.config import Settings
 from app.knowledge.retriever import Retriever
 from app.knowledge.vector_store import VectorSearchResult
+from app.llm.models import LLMMessage, LLMRequest
 from app.llm.provider import LLMProvider
 from app.rag.models import AnswerSource, GroundedAnswer
 
@@ -55,11 +56,18 @@ class AnswerGenerator:
             return GroundedAnswer(answer=NOT_AVAILABLE_ANSWER, sources=[])
 
         prompt = build_prompt(question, build_context(results), history)
-        answer_text = await self._llm_provider.generate_reply(prompt)
+        # AnswerGenerator never offers tools (LLMRequest.tools defaults
+        # to empty), so the response is always text - see README's Agent
+        # section for why this method stays this simple while
+        # AgentService (which does offer tools) needs its own, richer
+        # orchestration built from these same helper functions.
+        response = await self._llm_provider.generate(
+            LLMRequest(messages=[LLMMessage(role="user", content=prompt)])
+        )
 
         return GroundedAnswer(
-            answer=answer_text,
-            sources=[_to_source(result) for result in results],
+            answer=response.text,
+            sources=[to_source(result) for result in results],
         )
 
 
@@ -103,7 +111,7 @@ def build_prompt(
     return "\n\n".join(sections)
 
 
-def _to_source(result: VectorSearchResult) -> AnswerSource:
+def to_source(result: VectorSearchResult) -> AnswerSource:
     return AnswerSource(
         document_title=result.chunk.document_title,
         section_heading=result.chunk.section_heading,
