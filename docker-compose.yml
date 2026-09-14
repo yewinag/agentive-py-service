@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: agentive
+      POSTGRES_PASSWORD: agentive
+      POSTGRES_DB: agentive
+    ports:
+      - "5432:5432"
+    volumes:
+      - agentive_pgdata:/var/lib/postgresql/data
+
+volumes:
+  agentive_pgdata:

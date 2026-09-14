@@ -12,3 +12,11 @@ class EmbeddingProviderError(Exception):
     boundary, the same way LLMProviderError translates OpenAI SDK errors
     for chat.
     """
+
+
+class VectorStoreError(Exception):
+    """Raised when a VectorStore fails to store or search records.
+    Database/client-specific exceptions are translated into this at the
+    storage boundary, the same way EmbeddingProviderError translates
+    OpenAI SDK errors.
+    """

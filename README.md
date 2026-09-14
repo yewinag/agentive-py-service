@@ -27,9 +27,10 @@ Three boundaries, each with a single responsibility:
   `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
   is swappable without touching the chat layer.
 - **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
-  embeddable units: extraction (`DocumentExtractor`), chunking (`DocumentChunker`), and
-  embedding (`EmbeddingProvider`), each behind its own Protocol. Framework-independent: it
-  doesn't import FastAPI and isn't wired into any endpoint yet.
+  embeddable, storable units: extraction (`DocumentExtractor`), chunking (`DocumentChunker`),
+  embedding (`EmbeddingProvider`), and vector storage (`VectorStore`), each behind its own
+  Protocol. Framework-independent: it doesn't import FastAPI and isn't wired into any
+  endpoint yet.
 
 ## Current implementation status
 
@@ -46,10 +47,11 @@ Three boundaries, each with a single responsibility:
 - PDF document extraction
 - Section-aware document chunking
 - `EmbeddingProvider` Protocol, with fake and OpenAI implementations
+- `VectorStore` Protocol, with in-memory and PostgreSQL+pgvector implementations
 - Unit/integration tests
 
 **Not implemented yet:**
-- Vector database
+- Document ingestion pipeline/endpoint (the stages above aren't wired together yet)
 - Retrieval
 - RAG
 - Car-rental tools
@@ -65,12 +67,13 @@ app/
 ├── chats/           # Chat feature: router, schemas, ChatService
 ├── core/             # Cross-cutting config (Settings)
 ├── health/           # Health-check endpoint
-├── knowledge/         # Document contracts, extraction, chunking, embedding providers
+├── knowledge/         # Document contracts, extraction, chunking, embedding, vector storage
 └── llm/               # LLMProvider Protocol + fake/OpenAI implementations
 
 tests/                # Mirrors the app/ layout, one test package per feature
 data/
 └── knowledge/        # Source PDFs for the future knowledge base
+docker-compose.yml     # Local PostgreSQL + pgvector, for VECTOR_STORE_PROVIDER=pgvector
 ```
 
 ## Knowledge pipeline
@@ -91,13 +94,15 @@ DocumentChunk[]
 EmbeddingProvider
   ↓
 embedding vector[]
+  ↓
+VectorStore
+  ↓
+persisted, searchable chunks
 ```
 
 **Planned:**
 ```
-embedding vector[]
-  ↓
-Vector Store
+persisted, searchable chunks
   ↓
 Retrieval
   ↓
@@ -156,6 +161,9 @@ OPENAI_MODEL=gpt-4o-mini
 
 EMBEDDING_PROVIDER=fake             # "fake" or "openai" - independent of LLM_PROVIDER
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+VECTOR_STORE_PROVIDER=memory         # "memory" or "pgvector"
+DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive  # only for pgvector
 ```
 
 `.env` is gitignored and must never be committed — only `.env.example`, with placeholder
@@ -171,8 +179,20 @@ Coverage currently spans the health and chat endpoints, request validation, the 
 abstraction (fake, OpenAI with a mocked SDK client, and provider-selection/config-failure
 behavior), the knowledge-document contracts, the PDF extractor (including an integration check
 against the real PDFs in `data/knowledge/`), section-aware chunking (including chunk
-statistics against the real PDFs), and the embedding provider abstraction (fake, and OpenAI
-with a mocked SDK client). All tests run without any external network access or API key.
+statistics against the real PDFs), the embedding provider abstraction (fake, and OpenAI with a
+mocked SDK client), and the vector store abstraction (in-memory unit tests plus
+provider-selection/config-failure behavior). All of the above run without any external network
+access, API key, or database.
+
+A separate `tests/knowledge/test_pgvector_store_integration.py` exercises `PgVectorStore`
+against a real PostgreSQL+pgvector instance; it's skipped automatically unless `DATABASE_URL`
+is set, so it never affects the default `pytest -v` run. To run it locally:
+
+```bash
+docker compose up -d
+DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive \
+    python -m pytest tests/knowledge/test_pgvector_store_integration.py -v
+```
 
 ## PDF extraction
 
@@ -219,6 +239,60 @@ FakeEmbeddingProvider / OpenAIEmbeddingProvider
   ingestion endpoint consumes it yet (consistent with `DocumentExtractor`/`DocumentChunker`
   having no `Depends()` wiring either).
 
+## Vector storage
+
+```
+DocumentChunk + embedding
+  ↓
+VectorStore (Protocol)
+  ↑
+InMemoryVectorStore / PgVectorStore
+```
+
+**Technology: PostgreSQL + pgvector**, chosen over a dedicated vector database (Qdrant,
+Pinecone, Weaviate) and over a bespoke lightweight store:
+
+- **Metadata + vector search in one query.** RAG retrieval routinely needs "most similar
+  chunks, optionally filtered by document/section" — pgvector answers that with a normal SQL
+  query; a dedicated vector DB would need its metadata filtering feature to be reimplemented
+  or duplicated.
+- **One infrastructure dependency, not two, over this project's lifetime.** This service has
+  no database today. The roadmap already commits to conversation persistence later, which
+  will need a relational database regardless of what stores vectors. Choosing pgvector now
+  means that one Postgres instance serves both needs; choosing a dedicated vector DB now would
+  mean introducing Postgres separately later anyway.
+- **Operational complexity matches actual scale.** Two PDFs, on the order of ten chunks
+  today. A purpose-built ANN vector database earns its complexity at millions-of-vectors
+  scale; nothing here is close to that, now or in any near-term plan.
+- **Local dev and cost.** A single well-understood, widely-hosted (and often free-tier)
+  database, versus standing up and paying for a second stateful service.
+
+This is still "introducing another infrastructure dependency" — the project's own bar for
+that (see Engineering principles) is cleared here because persistence is what `VectorStore`
+inherently requires; it couldn't be built as a pure in-memory abstraction and still mean
+anything.
+
+**Storage model** — `VectorRecord` (write) and `VectorSearchResult` (read) wrap the existing
+`DocumentChunk` rather than duplicating its fields or extending it: an embedding is a property
+of how a chunk is *stored*, not a property of the chunk itself (the same chunk could be
+re-embedded by a different model later), so `DocumentChunk` was left unchanged. `PgVectorStore`
+persists `id, document_id, document_title, section_heading, text, position, embedding` -
+exactly what a future retrieval/RAG layer needs to use and cite a result, nothing more.
+
+**Similarity metric:** cosine similarity (pgvector's `<=>` operator; matched in pure Python for
+`InMemoryVectorStore`), appropriate for OpenAI's embeddings, which are documented as
+unit-normalized. Both implementations return a `score` where higher means more similar, so
+retrieval code doesn't need to know which backend is active.
+
+**Interface, not CRUD:** `VectorStore` exposes only `add` (batch upsert-by-chunk-id) and
+`search` (top-k similarity) - not generic get/update/delete, because nothing in this codebase
+needs to fetch or mutate one stored chunk in isolation yet.
+
+**Local development:** `docker compose up -d` starts a `pgvector/pgvector:pg16` container
+(see `docker-compose.yml`). `PgVectorStore.create_schema()` then creates the `vector`
+extension and this store's table - it's an explicit call, not run automatically on app start.
+The default `VECTOR_STORE_PROVIDER=memory` needs no database at all.
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -228,7 +302,8 @@ FakeEmbeddingProvider / OpenAIEmbeddingProvider
 - [x] PDF extraction foundation
 - [x] Document chunking
 - [x] Embedding provider
-- [ ] Vector store
+- [x] Vector store foundation
+- [ ] Document ingestion pipeline
 - [ ] Retrieval
 - [ ] RAG
 - [ ] Car-rental tools
@@ -249,5 +324,8 @@ FakeEmbeddingProvider / OpenAIEmbeddingProvider
   suite runs with no network access and no API keys.
 - **Incremental implementation** — each layer is built with only as much abstraction as its
   current, real consumer justifies; speculative generality is avoided.
-- **Avoiding unnecessary infrastructure** — no database, cache, queue, or vector store has
-  been introduced before the feature that actually needs it.
+- **Avoiding unnecessary infrastructure** — no cache, queue, or search-specific database has
+  been introduced speculatively. PostgreSQL (Step 9) is the first persistent store in this
+  service, added only once `VectorStore` made persistence unavoidable, and chosen to also
+  cover the roadmap's future relational needs (conversation persistence) instead of adding a
+  second stateful dependency later.

@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # are different OpenAI model families with different valid values.
     openai_embedding_model: str = "text-embedding-3-small"
 
+    # Selects the VectorStore implementation in app/knowledge/vector_store.py.
+    # One of: "memory", "pgvector".
+    vector_store_provider: str = "memory"
+
+    # Required only when vector_store_provider == "pgvector". No default
+    # on purpose, same reasoning as openai_api_key. Expected form:
+    # postgresql+asyncpg://user:password@host:5432/dbname
+    database_url: Optional[str] = None
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -11,11 +11,19 @@ from app.knowledge.exceptions import EmbeddingProviderError
 # use). Looked up here rather than hard-coded per instance so a caller
 # never has to guess - and so an unrecognized model fails clearly
 # instead of silently returning vectors of the wrong length.
-_KNOWN_MODEL_DIMENSIONS = {
+KNOWN_MODEL_DIMENSIONS = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
     "text-embedding-ada-002": 1536,
 }
+
+
+def known_embedding_dimensions(model: str) -> Optional[int]:
+    """Public lookup so other modules (e.g. VectorStore's composition
+    point, which needs to size a table before any embedding happens)
+    share this table instead of hard-coding their own copy.
+    """
+    return KNOWN_MODEL_DIMENSIONS.get(model)
 
 
 class OpenAIEmbeddingProvider:
@@ -34,7 +42,7 @@ class OpenAIEmbeddingProvider:
         self._model = model
         self._client = client or AsyncOpenAI(api_key=api_key)
 
-        resolved_dimensions = dimensions or _KNOWN_MODEL_DIMENSIONS.get(model)
+        resolved_dimensions = dimensions or known_embedding_dimensions(model)
         if resolved_dimensions is None:
             raise EmbeddingProviderError(
                 f"Unknown output dimensions for embedding model '{model}'. "
