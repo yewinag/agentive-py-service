@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Optional, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -60,18 +60,32 @@ class VectorStore(Protocol):
         ...
 
 
+_shared_in_memory_store: Optional["InMemoryVectorStore"] = None  # noqa: F821
+
+
 def get_vector_store(settings: Settings) -> VectorStore:
     """Composition point for VectorStore - selects the concrete store
     from Settings.vector_store_provider. A plain function, not FastAPI
     Depends()-wired, for the same reason as get_embedding_provider(): no
-    ingestion or retrieval endpoint consumes a VectorStore yet, and
-    app/knowledge has no FastAPI dependency today.
+    ingestion or retrieval endpoint consumes a VectorStore directly via
+    FastAPI yet.
+
+    For "memory", this returns a process-wide singleton, not a fresh
+    instance per call. Unlike PgVectorStore (a thin client over data
+    that lives in an external, already-shared database), an
+    InMemoryVectorStore's data lives inside the Python object itself -
+    a fresh instance per call would mean ingestion and retrieval never
+    see each other's writes, silently. reset_default_vector_store()
+    exists to clear this between tests.
     """
     from app.knowledge.in_memory_vector_store import InMemoryVectorStore
     from app.knowledge.pgvector_store import PgVectorStore
 
     if settings.vector_store_provider == "memory":
-        return InMemoryVectorStore()
+        global _shared_in_memory_store
+        if _shared_in_memory_store is None:
+            _shared_in_memory_store = InMemoryVectorStore()
+        return _shared_in_memory_store
 
     if settings.vector_store_provider == "pgvector":
         if not settings.database_url:
@@ -86,6 +100,15 @@ def get_vector_store(settings: Settings) -> VectorStore:
     raise NotImplementedError(
         f"Vector store '{settings.vector_store_provider}' is not implemented yet"
     )
+
+
+def reset_default_vector_store() -> None:
+    """Clears the process-wide InMemoryVectorStore singleton get_vector_store()
+    returns for vector_store_provider="memory". For tests/dev isolation
+    only - real request handling never needs to call this.
+    """
+    global _shared_in_memory_store
+    _shared_in_memory_store = None
 
 
 def _embedding_dimensions_for(settings: Settings) -> int:

@@ -11,5 +11,5 @@ async def create_chat_message(
     payload: ChatRequest,
     chat_service: ChatService = Depends(get_chat_service),
 ) -> ChatResponse:
-    reply = await chat_service.get_reply(payload.message)
-    return ChatResponse(reply=reply)
+    result = await chat_service.get_reply(payload.message)
+    return ChatResponse(reply=result.answer, sources=result.sources)

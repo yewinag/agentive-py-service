@@ -3,7 +3,14 @@ import pytest
 from app.core.config import Settings
 from app.knowledge.in_memory_vector_store import InMemoryVectorStore
 from app.knowledge.pgvector_store import PgVectorStore
-from app.knowledge.vector_store import get_vector_store
+from app.knowledge.vector_store import get_vector_store, reset_default_vector_store
+
+
+@pytest.fixture(autouse=True)
+def _reset_in_memory_singleton():
+    reset_default_vector_store()
+    yield
+    reset_default_vector_store()
 
 
 def test_get_vector_store_returns_in_memory_by_default():
@@ -12,6 +19,25 @@ def test_get_vector_store_returns_in_memory_by_default():
     store = get_vector_store(settings)
 
     assert isinstance(store, InMemoryVectorStore)
+
+
+def test_get_vector_store_returns_the_same_in_memory_instance_across_calls():
+    settings = Settings(vector_store_provider="memory")
+
+    first = get_vector_store(settings)
+    second = get_vector_store(settings)
+
+    assert first is second
+
+
+def test_reset_default_vector_store_clears_the_singleton():
+    settings = Settings(vector_store_provider="memory")
+    first = get_vector_store(settings)
+
+    reset_default_vector_store()
+    second = get_vector_store(settings)
+
+    assert first is not second
 
 
 def test_get_vector_store_returns_pgvector_store_when_configured():
