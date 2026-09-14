@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
 
+    # Selects the EmbeddingProvider implementation in
+    # app/knowledge/embedding.py. One of: "fake", "openai". Independent
+    # of llm_provider - chat replies and embeddings are separate concerns
+    # that happen to often use the same OpenAI account.
+    embedding_provider: str = "fake"
+
+    # Dedicated setting, not reused from openai_model: chat and embedding
+    # are different OpenAI model families with different valid values.
+    openai_embedding_model: str = "text-embedding-3-small"
+
 
 @lru_cache
 def get_settings() -> Settings:

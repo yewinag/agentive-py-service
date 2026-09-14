@@ -26,9 +26,10 @@ Three boundaries, each with a single responsibility:
 - **LLM provider layer** (`app/llm`) — answers "how do we generate a reply?" behind an
   `LLMProvider` Protocol, so the concrete provider (a fake, OpenAI, or anything else later)
   is swappable without touching the chat layer.
-- **Knowledge/document layer** (`app/knowledge`) — answers "how do we turn source documents
-  into usable text?" behind a `DocumentExtractor` Protocol. Framework-independent: it doesn't
-  import FastAPI and isn't wired into any endpoint yet.
+- **Knowledge/document layer** (`app/knowledge`) — turns source documents into retrievable,
+  embeddable units: extraction (`DocumentExtractor`), chunking (`DocumentChunker`), and
+  embedding (`EmbeddingProvider`), each behind its own Protocol. Framework-independent: it
+  doesn't import FastAPI and isn't wired into any endpoint yet.
 
 ## Current implementation status
 
@@ -43,14 +44,15 @@ Three boundaries, each with a single responsibility:
 - OpenAI LLM provider
 - Environment-based configuration
 - PDF document extraction
+- Section-aware document chunking
+- `EmbeddingProvider` Protocol, with fake and OpenAI implementations
 - Unit/integration tests
 
 **Not implemented yet:**
-- Chunking
-- Embeddings
 - Vector database
 - Retrieval
 - RAG
+- Car-rental tools
 - Agent/tool orchestration
 - Conversation persistence
 - Production deployment
@@ -63,7 +65,7 @@ app/
 ├── chats/           # Chat feature: router, schemas, ChatService
 ├── core/             # Cross-cutting config (Settings)
 ├── health/           # Health-check endpoint
-├── knowledge/         # Document contracts + extraction (PDF, fake)
+├── knowledge/         # Document contracts, extraction, chunking, embedding providers
 └── llm/               # LLMProvider Protocol + fake/OpenAI implementations
 
 tests/                # Mirrors the app/ layout, one test package per feature
@@ -73,22 +75,27 @@ data/
 
 ## Knowledge pipeline
 
-**Current:**
+**Current** (each stage implemented and tested; not yet wired together into one ingestion
+flow — there is no ingestion endpoint or script that runs all of them in sequence):
 ```
 PDF
   ↓
 PdfDocumentExtractor
   ↓
 ExtractedDocument
+  ↓
+SectionAwareChunker
+  ↓
+DocumentChunk[]
+  ↓
+EmbeddingProvider
+  ↓
+embedding vector[]
 ```
 
 **Planned:**
 ```
-ExtractedDocument
-  ↓
-Chunking
-  ↓
-Embeddings
+embedding vector[]
   ↓
 Vector Store
   ↓
@@ -144,8 +151,11 @@ ENVIRONMENT=development
 DEBUG=false
 
 LLM_PROVIDER=fake        # "fake" or "openai"
-OPENAI_API_KEY=sk-...     # required only when LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...     # required when LLM_PROVIDER=openai or EMBEDDING_PROVIDER=openai
 OPENAI_MODEL=gpt-4o-mini
+
+EMBEDDING_PROVIDER=fake             # "fake" or "openai" - independent of LLM_PROVIDER
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
 `.env` is gitignored and must never be committed — only `.env.example`, with placeholder
@@ -159,9 +169,10 @@ python -m pytest -v
 
 Coverage currently spans the health and chat endpoints, request validation, the LLM provider
 abstraction (fake, OpenAI with a mocked SDK client, and provider-selection/config-failure
-behavior), and the knowledge-document contracts and PDF extractor (including an integration
-check against the real PDFs in `data/knowledge/`). All tests run without any external network
-access or API key.
+behavior), the knowledge-document contracts, the PDF extractor (including an integration check
+against the real PDFs in `data/knowledge/`), section-aware chunking (including chunk
+statistics against the real PDFs), and the embedding provider abstraction (fake, and OpenAI
+with a mocked SDK client). All tests run without any external network access or API key.
 
 ## PDF extraction
 
@@ -181,6 +192,33 @@ access or API key.
   `data/knowledge/car-rental-policies.pdf`) have been successfully extracted and verified by
   the integration tests in `tests/knowledge/test_pdf_extractor_integration.py`.
 
+## Embeddings
+
+```
+DocumentChunk[]
+  ↓
+EmbeddingProvider (Protocol)
+  ↑
+FakeEmbeddingProvider / OpenAIEmbeddingProvider
+```
+
+- `EmbeddingProvider` (`app/knowledge/embedding.py`) takes a batch of texts and returns one
+  vector per text, in input order — ingestion will always embed many chunks at once, never
+  one in isolation.
+- `OpenAIEmbeddingProvider` uses OpenAI's `text-embedding-3-small` by default (a cost-efficient
+  current-generation model); the openai SDK is isolated to
+  `app/knowledge/openai_embedding_provider.py` alone. Output vector length is resolved from a
+  small table of known models' dimensions rather than hard-coded, and construction fails
+  clearly for an unrecognized model unless a dimension is passed explicitly.
+- SDK/API failures are translated into the application's own `EmbeddingProviderError` —
+  the same pattern `LLMProviderError` and `DocumentExtractionError` already use.
+- `FakeEmbeddingProvider` returns deterministic, hash-derived vectors, so the default
+  configuration and the full test suite never require an OpenAI API key or network access.
+- Provider selection (`EMBEDDING_PROVIDER=fake|openai`) is independent of `LLM_PROVIDER` — a
+  dedicated `get_embedding_provider()` composition function, not yet FastAPI-wired since no
+  ingestion endpoint consumes it yet (consistent with `DocumentExtractor`/`DocumentChunker`
+  having no `Depends()` wiring either).
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -188,8 +226,8 @@ access or API key.
 - [x] LLM provider abstraction
 - [x] OpenAI provider
 - [x] PDF extraction foundation
-- [ ] Document chunking
-- [ ] Embeddings
+- [x] Document chunking
+- [x] Embedding provider
 - [ ] Vector store
 - [ ] Retrieval
 - [ ] RAG
