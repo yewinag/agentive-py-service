@@ -1,4 +1,4 @@
-"""Ingests the two real, committed car-rental PDFs through the real
+"""Ingests the six real, committed canonical PDFs through the real
 PdfDocumentExtractor + SectionAwareChunker (not fakes), proving
 IngestionService "supports processing the current knowledge documents
 deterministically". Embedding stays fake so this needs no network/API
@@ -23,8 +23,17 @@ pytestmark = pytest.mark.skipif(
     reason="data/knowledge/ not present in this checkout",
 )
 
+CANONICAL_TITLES = {
+    "01-rental-services.pdf": "Rental Services",
+    "02-rental-policies.pdf": "Rental Policies",
+    "03-booking-policy.pdf": "Booking Policy",
+    "04-cancellation-policy.pdf": "Cancellation Policy",
+    "05-payment-policy.pdf": "Payment Policy",
+    "06-pickup-return-policy.pdf": "Pickup and Return Policy",
+}
 
-def test_ingest_processes_both_real_pdfs_deterministically():
+
+def test_ingest_processes_all_six_canonical_pdfs_deterministically():
     store = InMemoryVectorStore()
     service = IngestionService(
         extractor=PdfDocumentExtractor(),
@@ -33,26 +42,18 @@ def test_ingest_processes_both_real_pdfs_deterministically():
         vector_store=store,
     )
     sources = [
-        DocumentSource(
-            id="car-rental-services.pdf",
-            title="Services Breakdown",
-            content=str(KNOWLEDGE_DIR / "car-rental-services.pdf"),
-        ),
-        DocumentSource(
-            id="car-rental-policies.pdf",
-            title="Terms & Rental Policies",
-            content=str(KNOWLEDGE_DIR / "car-rental-policies.pdf"),
-        ),
+        DocumentSource(id=filename, title=title, content=str(KNOWLEDGE_DIR / filename))
+        for filename, title in CANONICAL_TITLES.items()
     ]
 
     first_run_count = asyncio.run(service.ingest(sources))
     second_run_count = asyncio.run(service.ingest(sources))  # re-ingest: upsert, not duplication
 
-    # Matches Step 7's known chunk counts for these exact PDFs: 4 (services) + 6 (policies).
-    assert first_run_count == 10
-    assert second_run_count == 10
+    # Matches the six canonical PDFs' measured chunk counts: 4+4+4+3+4+3 = 22.
+    assert first_run_count == 22
+    assert second_run_count == 22
 
     results = asyncio.run(store.search(query_embedding=[0.0] * 8, top_k=100))
-    assert len(results) == 10  # re-ingesting didn't duplicate chunks
+    assert len(results) == 22  # re-ingesting didn't duplicate chunks
     document_ids = {result.chunk.document_id for result in results}
-    assert document_ids == {"car-rental-services.pdf", "car-rental-policies.pdf"}
+    assert document_ids == set(CANONICAL_TITLES)

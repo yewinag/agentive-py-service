@@ -180,9 +180,13 @@ trigger - the default in-memory store is populated by an explicit startup bootst
 planning, conversation summarization, and durable (cross-process) conversation persistence
 remain future work.
 
-The two PDFs in `data/knowledge/` (`car-rental-services.pdf`, `car-rental-policies.pdf`) are
-the car-rental knowledge sources this pipeline is built, tested, and (by default) bootstrapped
-around.
+The six PDFs in `data/knowledge/` (`01-rental-services.pdf`, `02-rental-policies.pdf`,
+`03-booking-policy.pdf`, `04-cancellation-policy.pdf`, `05-payment-policy.pdf`,
+`06-pickup-return-policy.pdf`) are the canonical car-rental knowledge sources this pipeline is
+built, tested, and (by default) bootstrapped around. Two earlier, broader PDFs
+(`car-rental-services.pdf`, `car-rental-policies.pdf`) covered similar ground with some
+conflicting numbers (e.g. cancellation fee percentages, deposit refund windows) and have been
+retired in favor of these six more focused, mutually-consistent documents.
 
 ## LLM provider architecture
 
@@ -215,8 +219,8 @@ Available endpoints:
 - `GET /health` — service health check
 - `GET /docs` — interactive Swagger UI
 - `POST /api/v1/chat` — returns a knowledge-grounded, tool-assisted, multi-turn-aware answer, by
-  default drawn from the two PDFs bootstrapped into the in-memory store at startup (see Chat API
-  integration, Conversation context, and Agent / tool calling below). The response never
+  default drawn from the six canonical PDFs bootstrapped into the in-memory store at startup (see
+  Chat API integration, Conversation context, and Agent / tool calling below). The response never
   reveals whether a tool was used - the contract stays `reply`/`sources`/`conversation_id`
   either way.
 
@@ -229,7 +233,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/chat \
 {
   "reply": "...",
   "sources": [
-    {"document_title": "Terms & Rental Policies", "section_heading": "1. Driver Eligibility & Required Documents"}
+    {"document_title": "Rental Policies", "section_heading": "1. Eligibility Requirements"}
   ],
   "conversation_id": "6a0fa43e630b4c418d63e9735dbfe4ea"
 }
@@ -306,7 +310,8 @@ mocked SDK client), the vector store abstraction (in-memory unit tests plus
 provider-selection/config-failure behavior), the retrieval layer (orchestration tests with
 stub providers/stores, plus a deterministic end-to-end test using the real
 `FakeEmbeddingProvider` + `InMemoryVectorStore`), `IngestionService` (fake-provider unit tests
-plus an integration test processing the two real PDFs through the real extractor/chunker), and
+plus an integration test processing all six real, canonical PDFs through the real
+extractor/chunker), and
 `AnswerGenerator` (still fully covered exactly as in Step 11/13 - a stub `LLMProvider` and
 directly-tested `build_context`/`build_history_block`/`build_prompt`, plus a full end-to-end
 test chaining `FakeDocumentExtractor → SectionAwareChunker → FakeEmbeddingProvider →
@@ -368,9 +373,9 @@ DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive \
 - Extraction failures (corrupt files, missing files, no extractable text) are translated into
   the application's own `DocumentExtractionError` — no `pdfplumber`/`pdfminer` exception ever
   crosses that boundary.
-- The two current PDFs (`data/knowledge/car-rental-services.pdf`,
-  `data/knowledge/car-rental-policies.pdf`) have been successfully extracted and verified by
-  the integration tests in `tests/knowledge/test_pdf_extractor_integration.py`.
+- The six canonical PDFs in `data/knowledge/` (`01-rental-services.pdf` through
+  `06-pickup-return-policy.pdf`) have been successfully extracted and verified by the
+  integration tests in `tests/knowledge/test_pdf_extractor_integration.py`.
 
 ## Embeddings
 
@@ -724,7 +729,7 @@ HTTP client → NestJS Business API  (future, not built)
 | | Knowledge base (`app/knowledge`, RAG) | Tools (`app/tools`) |
 |---|---|---|
 | Answers | Relatively static knowledge: policies, services, vehicle-use rules, requirements, general pricing *stated in documents* | Dynamic/live business operations: vehicle availability, booking lookup/creation/modification, customer-specific data |
-| Source of truth | The two PDFs, via retrieval | The business system (future: NestJS Business API) |
+| Source of truth | The six canonical PDFs, via retrieval | The business system (future: NestJS Business API) |
 | Mechanism | Embedding + vector similarity search | Structured, validated function-style calls |
 
 This Python service must never become the owner of rental business data. `app/tools` is

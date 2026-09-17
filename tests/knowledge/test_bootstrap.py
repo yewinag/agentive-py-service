@@ -19,7 +19,7 @@ def test_bootstrap_ingests_the_real_pdfs_into_the_default_store():
 
     count = asyncio.run(bootstrap_default_knowledge_base(settings))
 
-    assert count == 10  # 4 (services) + 6 (policies), per Step 7/9's known counts
+    assert count == 22  # 4+4+4+3+4+3 across the six canonical PDFs
 
 
 def test_bootstrap_populates_the_same_store_get_vector_store_returns():
@@ -29,7 +29,7 @@ def test_bootstrap_populates_the_same_store_get_vector_store_returns():
 
     store = get_vector_store(settings)
     results = asyncio.run(store.search(query_embedding=[0.0] * 8, top_k=100))
-    assert len(results) == 10
+    assert len(results) == 22
 
 
 def test_bootstrap_is_idempotent_across_repeated_calls():
@@ -40,9 +40,9 @@ def test_bootstrap_is_idempotent_across_repeated_calls():
 
     store = get_vector_store(settings)
     results = asyncio.run(store.search(query_embedding=[0.0] * 8, top_k=100))
-    assert first_count == 10
-    assert second_count == 10
-    assert len(results) == 10  # re-running never duplicates chunks
+    assert first_count == 22
+    assert second_count == 22
+    assert len(results) == 22  # re-running never duplicates chunks
 
 
 def test_bootstrap_is_a_no_op_for_pgvector():

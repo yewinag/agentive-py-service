@@ -24,17 +24,20 @@ def _extract(filename: str, title: str):
     return asyncio.run(PdfDocumentExtractor().extract(source))
 
 
-def test_services_pdf_extracts_expected_content():
-    extracted = _extract("car-rental-services.pdf", "Services Breakdown")
+@pytest.mark.parametrize(
+    "filename, title, expected_snippets",
+    [
+        ("01-rental-services.pdf", "Rental Services", ["Chauffeur Services", "Suvarnabhumi Airport"]),
+        ("02-rental-policies.pdf", "Rental Policies", ["Minimum Age", "Collision Damage Waiver"]),
+        ("03-booking-policy.pdf", "Booking Policy", ["Reservation ID", "Flight details"]),
+        ("04-cancellation-policy.pdf", "Cancellation Policy", ["No-Show", "50% of the"]),
+        ("05-payment-policy.pdf", "Payment Policy", ["Security Deposit", "PromptPay"]),
+        ("06-pickup-return-policy.pdf", "Pickup and Return Policy", ["Vehicle Condition Form", "Grace Period"]),
+    ],
+)
+def test_canonical_pdf_extracts_expected_content(filename, title, expected_snippets):
+    extracted = _extract(filename, title)
 
     assert extracted.page_count == 1
-    assert "Economy & Sedan Rental" in extracted.text
-    assert "Chauffeur" in extracted.text
-
-
-def test_policies_pdf_extracts_expected_content():
-    extracted = _extract("car-rental-policies.pdf", "Terms & Rental Policies")
-
-    assert extracted.page_count == 2
-    assert "Minimum Age" in extracted.text
-    assert "Late Return Policy" in extracted.text
+    for snippet in expected_snippets:
+        assert snippet in extracted.text

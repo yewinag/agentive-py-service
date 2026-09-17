@@ -6,12 +6,18 @@ from app.knowledge.models import DocumentSource
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "data" / "knowledge"
 
-# The only two documents this project has today (see data/knowledge/).
-# A hardcoded mapping is honest about that, rather than deriving a title
-# from the filename for documents that don't exist yet.
+# The six canonical documents this project has today (see
+# data/knowledge/). A hardcoded mapping is honest about that, rather
+# than deriving a title from the filename for documents that don't
+# exist yet. The two older, superseded PDFs (car-rental-services.pdf,
+# car-rental-policies.pdf) have been retired in favor of these.
 _KNOWN_DOCUMENT_TITLES = {
-    "car-rental-services.pdf": "Services Breakdown",
-    "car-rental-policies.pdf": "Terms & Rental Policies",
+    "01-rental-services.pdf": "Rental Services",
+    "02-rental-policies.pdf": "Rental Policies",
+    "03-booking-policy.pdf": "Booking Policy",
+    "04-cancellation-policy.pdf": "Cancellation Policy",
+    "05-payment-policy.pdf": "Payment Policy",
+    "06-pickup-return-policy.pdf": "Pickup and Return Policy",
 }
 
 
