@@ -3,8 +3,26 @@ import asyncio
 import pytest
 
 from app.core.config import Settings
-from app.knowledge.bootstrap import bootstrap_default_knowledge_base
+from app.knowledge.bootstrap import bootstrap_default_knowledge_base, discover_canonical_sources
 from app.knowledge.vector_store import get_vector_store, reset_default_vector_store
+
+CANONICAL_FILENAMES = {
+    "01-rental-services.pdf",
+    "02-rental-policies.pdf",
+    "03-booking-policy.pdf",
+    "04-cancellation-policy.pdf",
+    "05-payment-policy.pdf",
+    "06-pickup-return-policy.pdf",
+}
+
+
+def test_discover_canonical_sources_finds_all_six_pdfs_with_clean_titles():
+    sources = discover_canonical_sources()
+
+    assert {source.id for source in sources} == CANONICAL_FILENAMES
+    assert all(source.title and not source.title.endswith(".pdf") for source in sources)
+    # every source's content is a real path to a PDF that exists on disk
+    assert all(source.content.endswith(".pdf") for source in sources)
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +68,18 @@ def test_bootstrap_is_a_no_op_for_pgvector():
         vector_store_provider="pgvector",
         database_url="postgresql+asyncpg://user:pass@localhost/db",
     )
+
+    count = asyncio.run(bootstrap_default_knowledge_base(settings))
+
+    assert count == 0
+
+
+def test_bootstrap_is_a_no_op_for_qdrant():
+    """Qdrant is a persistent, already-shared store - just like pgvector,
+    it must never be auto-ingested into on every app boot. See
+    app/knowledge/ingest.py for Qdrant's real, explicit ingestion path.
+    """
+    settings = Settings(vector_store_provider="qdrant")
 
     count = asyncio.run(bootstrap_default_knowledge_base(settings))
 

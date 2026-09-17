@@ -10,5 +10,18 @@ services:
     volumes:
       - agentive_pgdata:/var/lib/postgresql/data
 
+  # AI knowledge vector store (RAG over the PDFs in data/knowledge/) -
+  # separate from postgres above, which remains this project's relational
+  # store (used by PgVectorStore today; the business database - Cars,
+  # Bookings, Payments - lives in the unrelated Strapi/Postgres project).
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333" # REST API
+      - "6334:6334" # gRPC API
+    volumes:
+      - agentive_qdrant_data:/qdrant/storage
+
 volumes:
   agentive_pgdata:
+  agentive_qdrant_data:

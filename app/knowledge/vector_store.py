@@ -80,6 +80,7 @@ def get_vector_store(settings: Settings) -> VectorStore:
     """
     from app.knowledge.in_memory_vector_store import InMemoryVectorStore
     from app.knowledge.pgvector_store import PgVectorStore
+    from app.knowledge.qdrant_vector_store import QdrantVectorStore
 
     if settings.vector_store_provider == "memory":
         global _shared_in_memory_store
@@ -94,6 +95,13 @@ def get_vector_store(settings: Settings) -> VectorStore:
             )
         return PgVectorStore(
             database_url=settings.database_url,
+            dimensions=_embedding_dimensions_for(settings),
+        )
+
+    if settings.vector_store_provider == "qdrant":
+        return QdrantVectorStore(
+            url=settings.qdrant_url,
+            collection_name=settings.qdrant_collection,
             dimensions=_embedding_dimensions_for(settings),
         )
 
@@ -112,16 +120,18 @@ def reset_default_vector_store() -> None:
 
 
 def _embedding_dimensions_for(settings: Settings) -> int:
-    """PgVectorStore's table needs a fixed vector width up front. Reuses
-    the same known-model lookup EmbeddingProvider already uses, so the
-    two never drift apart, rather than a separately configured number.
+    """Both PgVectorStore and QdrantVectorStore need a fixed vector width
+    up front, before any embedding actually happens. Building the real
+    EmbeddingProvider the settings select - fake or openai, whichever is
+    actually configured - and reading its `dimensions` property is the
+    single source of truth for that width. This used to instead look up
+    `settings.openai_embedding_model` directly, which silently assumed
+    OpenAI embeddings regardless of `embedding_provider`; a store built
+    that way while `EMBEDDING_PROVIDER=fake` would be sized for the
+    wrong vector length; now the two can never disagree, because both
+    the store and the ingestion pipeline resolve dimensions from the
+    same EmbeddingProvider instance's own declared width.
     """
-    from app.knowledge.openai_embedding_provider import known_embedding_dimensions
+    from app.knowledge.embedding import get_embedding_provider
 
-    dimensions = known_embedding_dimensions(settings.openai_embedding_model)
-    if dimensions is None:
-        raise RuntimeError(
-            f"Unknown output dimensions for embedding model "
-            f"'{settings.openai_embedding_model}'; cannot size the pgvector table."
-        )
-    return dimensions
+    return get_embedding_provider(settings).dimensions

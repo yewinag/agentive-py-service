@@ -137,7 +137,9 @@ app/
 tests/                # Mirrors the app/ layout, one test package per feature
 data/
 └── knowledge/        # Source PDFs bootstrapped into the default knowledge store
-docker-compose.yml     # Local PostgreSQL + pgvector, for VECTOR_STORE_PROVIDER=pgvector
+docker-compose.yml     # Local PostgreSQL+pgvector (VECTOR_STORE_PROVIDER=pgvector) and Qdrant
+                       # (VECTOR_STORE_PROVIDER=qdrant) - the AI knowledge store for this
+                       # project; unrelated to the separate Strapi/PostgreSQL business database
 ```
 
 ## Knowledge pipeline
@@ -268,8 +270,10 @@ OPENAI_MODEL=gpt-4o-mini
 EMBEDDING_PROVIDER=fake             # "fake" or "openai" - independent of LLM_PROVIDER
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
-VECTOR_STORE_PROVIDER=memory         # "memory" or "pgvector"
+VECTOR_STORE_PROVIDER=memory         # "memory", "pgvector", or "qdrant"
 DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive  # only for pgvector
+QDRANT_URL=http://localhost:6333             # only for qdrant
+QDRANT_COLLECTION=knowledge_chunk_embeddings # only for qdrant
 
 RETRIEVAL_TOP_K=5                    # default VectorRetriever.retrieve() top_k
 # RETRIEVAL_MIN_SCORE=0.75           # unset by default - see Retrieval section below
@@ -294,6 +298,23 @@ safe to default without usage data), this bound is a scoped safety constraint fo
 (see Scope restrictions), and making it configurable would let it be silently raised past what
 this step was actually built and tested for. The grounding system prompt remains a fixed code
 constant too, for the same reason as always - not something that should vary by environment.
+
+Phase 2.5 (Qdrant) adds `QDRANT_URL`/`QDRANT_COLLECTION` only. There is deliberately no separate
+`QDRANT_VECTOR_SIZE` setting: vector width is derived from whichever embedding provider is
+actually configured (`get_vector_store()`'s `_embedding_dimensions_for()`, shared by `pgvector`
+and `qdrant`), so the two can never silently drift apart.
+
+**Phase 2.6 fix:** `_embedding_dimensions_for()` used to resolve dimensions from
+`OPENAI_EMBEDDING_MODEL` directly, regardless of `EMBEDDING_PROVIDER` - so `VECTOR_STORE_PROVIDER=
+qdrant`/`pgvector` combined with the default `EMBEDDING_PROVIDER=fake` would size the
+collection/table for an OpenAI model's dimensions instead of `FakeEmbeddingProvider`'s, and writes
+would fail with a dimension mismatch. It now instead builds the real, configured
+`EmbeddingProvider` (`get_embedding_provider(settings)`) and reads its `dimensions` property - the
+same instance that will actually do the embedding - so the vector store is always sized correctly
+for whichever provider (`fake` or `openai`) is selected, without a second, independently
+configured dimension value to keep in sync. Both `PgVectorStore` and `QdrantVectorStore` expose
+their resolved width via a `.dimensions` property, so this agreement is directly testable rather
+than only inferred from a successful write (`tests/knowledge/test_vector_store_selection.py`).
 
 ## Testing
 
@@ -359,6 +380,28 @@ DATABASE_URL=postgresql+asyncpg://agentive:agentive@localhost:5432/agentive \
     python -m pytest tests/knowledge/test_pgvector_store_integration.py -v
 ```
 
+Similarly, `tests/knowledge/test_qdrant_vector_store_integration.py` exercises `QdrantVectorStore`
+against a real Qdrant instance; it's skipped automatically unless `QDRANT_URL` is set. Covers
+collection creation (and idempotent re-creation), upsert, search, metadata preservation, an
+empty/never-created collection returning `[]` rather than erroring, multiple documents/chunks,
+and - via a second `QdrantVectorStore` built from a fresh client against the same collection name
+- that data survives what amounts to an application restart. To run it locally:
+
+```bash
+docker compose up -d qdrant
+QDRANT_URL=http://localhost:6333 python -m pytest tests/knowledge/test_qdrant_vector_store_integration.py -v
+```
+
+`tests/knowledge/test_ingest_command.py` covers the explicit ingestion command's
+(`app/knowledge/ingest.py`) own control flow without any real Qdrant or PDFs (it refuses cleanly,
+exit code 1, for every non-`qdrant` `VECTOR_STORE_PROVIDER`) - it never needs `QDRANT_URL` and
+always runs. `tests/knowledge/test_qdrant_ingestion_command_integration.py` is the real,
+skip-gated (`QDRANT_URL`) round trip: all six canonical PDFs discovered, 22 chunks/vectors
+produced, a second run staying at 22 (idempotent), `--reset` recreating the collection without
+duplicating, and a fresh `QdrantVectorStore` retrieving what a prior run persisted.
+`tests/knowledge/test_bootstrap.py` also gained a `discover_canonical_sources()` unit test and a
+`vector_store_provider="qdrant"` no-op case, alongside its existing `pgvector` one.
+
 ## PDF extraction
 
 - [`pdfplumber`](https://github.com/jsvine/pdfplumber) is currently used for PDF text
@@ -411,11 +454,27 @@ DocumentChunk + embedding
   ↓
 VectorStore (Protocol)
   ↑
-InMemoryVectorStore / PgVectorStore
+InMemoryVectorStore / PgVectorStore / QdrantVectorStore
 ```
 
-**Technology: PostgreSQL + pgvector**, chosen over a dedicated vector database (Qdrant,
-Pinecone, Weaviate) and over a bespoke lightweight store:
+**Qdrant is this project's AI knowledge store; PostgreSQL is not.** The wider system
+architecture settled on a clear split: PostgreSQL (via the separate Strapi project) owns
+business/transactional data (Cars, Bookings, Payments) and is never touched by this service;
+Qdrant owns AI knowledge (the six canonical PDFs, as embeddings) for this service. `PgVectorStore`
+remains implemented and tested below - it predates that split and is kept as a working
+`VectorStore` implementation - but `qdrant` is the intended `VECTOR_STORE_PROVIDER` for this
+project going forward. This project's own `docker-compose.yml` also runs a `postgres` container
+for `PgVectorStore`, but that is a private, disposable local database for this optional vector
+store only - it has no relationship to, and shares no data with, the Strapi business database.
+
+**Why not pgvector after all:** the reasoning below (metadata + vector search in one query, one
+infrastructure dependency) was sound in isolation, but assumed this service would eventually own
+a relational database for its own needs (e.g. conversation persistence). The confirmed system
+architecture instead keeps this service's only stateful dependency AI-knowledge-shaped
+(Qdrant) and leaves relational/business persistence entirely to the separate Strapi/PostgreSQL
+project - so the "one Postgres serves both needs" argument no longer applies.
+
+**Technology comparison, updated:**
 
 - **Metadata + vector search in one query.** RAG retrieval routinely needs "most similar
   chunks, optionally filtered by document/section" — pgvector answers that with a normal SQL
@@ -444,19 +503,33 @@ re-embedded by a different model later), so `DocumentChunk` was left unchanged. 
 persists `id, document_id, document_title, section_heading, text, position, embedding` -
 exactly what a future retrieval/RAG layer needs to use and cite a result, nothing more.
 
-**Similarity metric:** cosine similarity (pgvector's `<=>` operator; matched in pure Python for
-`InMemoryVectorStore`), appropriate for OpenAI's embeddings, which are documented as
-unit-normalized. Both implementations return a `score` where higher means more similar, so
-retrieval code doesn't need to know which backend is active.
+**Similarity metric:** cosine similarity (pgvector's `<=>` operator, converted from distance to
+similarity; Qdrant's `Distance.COSINE`, already a similarity so no conversion needed; matched in
+pure Python for `InMemoryVectorStore`) - appropriate for OpenAI's embeddings, which are
+documented as unit-normalized. All three implementations return a `score` where higher means
+more similar, so retrieval code doesn't need to know which backend is active.
 
 **Interface, not CRUD:** `VectorStore` exposes only `add` (batch upsert-by-chunk-id) and
 `search` (top-k similarity) - not generic get/update/delete, because nothing in this codebase
 needs to fetch or mutate one stored chunk in isolation yet.
 
-**Local development:** `docker compose up -d` starts a `pgvector/pgvector:pg16` container
-(see `docker-compose.yml`). `PgVectorStore.create_schema()` then creates the `vector`
-extension and this store's table - it's an explicit call, not run automatically on app start.
-The default `VECTOR_STORE_PROVIDER=memory` needs no database at all.
+**`QdrantVectorStore`** (`app/knowledge/qdrant_vector_store.py`) stores each chunk as a Qdrant
+point, with the chunk's fields (`chunk_id, document_id, document_title, section_heading, text,
+position`) in the point's payload - the same information `PgVectorStore` keeps in table columns,
+just payload-shaped instead of row-shaped. One real constraint the abstraction had to absorb:
+Qdrant point ids must be an unsigned integer or a UUID, but this project's chunk ids are strings
+like `01-rental-services.pdf-chunk-0`. `QdrantVectorStore` derives a deterministic UUID from each
+chunk id (`uuid.uuid5` against a fixed namespace) to use as the actual point id, and keeps the
+real chunk id in the payload; `add()` therefore still upserts by chunk id exactly as the
+`VectorStore` contract requires, and every caller only ever sees the original string chunk id.
+`ensure_collection()` (create-if-missing) and `delete_collection()` mirror `PgVectorStore`'s
+`create_schema()`/`drop_schema()` - explicit, not run automatically on app start.
+
+**Local development:** `docker compose up -d` starts both a `pgvector/pgvector:pg16` container
+(for `PgVectorStore`) and a `qdrant/qdrant:latest` container (for `QdrantVectorStore`), each with
+its own named, persistent volume - so vectors survive a container restart. `PgVectorStore`'s
+`create_schema()` / `QdrantVectorStore`'s `ensure_collection()` are both explicit calls, not run
+automatically on app start. The default `VECTOR_STORE_PROVIDER=memory` needs neither database.
 
 ## Retrieval
 
@@ -515,9 +588,70 @@ async def ingest(self, sources: list[DocumentSource]) -> int: ...
   scheduling - those are separate future concerns, out of scope for this foundation.
 - `add()` on `VectorStore` is upsert-by-chunk-id, so re-running ingestion on the same sources
   doesn't duplicate chunks - verified by `tests/knowledge/test_ingestion_integration.py`, which
-  ingests the two real PDFs twice and confirms the stored count doesn't grow.
+  ingests all six real, canonical PDFs twice and confirms the stored count stays at 22.
 - `get_ingestion_service(settings)` is the composition point, following the same
   plain-function, no-`Depends()` pattern as every other `app/knowledge` composition function.
+
+### Explicit knowledge ingestion command (Qdrant)
+
+**FastAPI startup ≠ knowledge ingestion.** `bootstrap_default_knowledge_base()` (see Chat API
+integration) only ever populates the transient, in-process `InMemoryVectorStore` - it is a no-op
+for every persistent store (`pgvector`, `qdrant`), on purpose: a persistent store already has
+whatever was ingested into it, and re-running real embedding calls on every app boot for no
+benefit would be wasteful. Getting the six canonical PDFs into Qdrant is therefore a deliberate,
+standalone, explicit operation - not something starting the FastAPI app ever does for you:
+
+```bash
+docker compose up -d qdrant
+VECTOR_STORE_PROVIDER=qdrant python -m app.knowledge.ingest
+```
+
+```
+Knowledge ingestion started
+Documents discovered: 6
+Documents processed: 6
+Chunks generated: 22
+Vectors upserted: 22
+Collection: knowledge_chunk_embeddings
+Status: SUCCESS
+```
+
+This command (`app/knowledge/ingest.py`) needs no running FastAPI process - it composes the same
+`PdfDocumentExtractor`/`SectionAwareChunker`/`EmbeddingProvider`/`VectorStore` abstractions
+`IngestionService` already orchestrates, wired via the same `Settings`/composition-function
+pattern every other layer uses (`get_embedding_provider(settings)`, `get_vector_store(settings)`)
+- no ingestion logic was duplicated to build it. It refuses to run (exit code 1, no PDFs touched)
+unless `VECTOR_STORE_PROVIDER=qdrant`, since it exists specifically to persist knowledge into
+Qdrant.
+
+**Idempotent by construction:** running it twice does not duplicate vectors. Each `DocumentChunk`
+has a stable id (`{document_id}-chunk-{n}`); `QdrantVectorStore` derives a deterministic point id
+from that chunk id (see Vector storage), so `add()` always upserts the same point rather than
+creating a new one. First run: 6 PDFs → 22 chunks → 22 points. Second run: 6 PDFs → 22 chunks →
+still 22 points, each one's content refreshed in place.
+
+**Persistence:** Qdrant's data lives in the `agentive_qdrant_data` docker volume (see
+`docker-compose.yml`), not in the Python process. A fresh `QdrantVectorStore`/client - including
+across a full container restart (`docker compose restart qdrant`), not just a new app process -
+sees everything a prior ingestion run wrote; verified live for this phase, not just asserted.
+
+**Handling stale documents:** the ingestion command only ever adds/updates chunks for PDFs
+currently in `data/knowledge/` - it never deletes a point for a document that used to exist but
+doesn't anymore. Renaming or removing a canonical PDF therefore leaves its old chunks orphaned in
+Qdrant (retrievable forever, even though the source document is gone) unless you pass `--reset`:
+
+```bash
+VECTOR_STORE_PROVIDER=qdrant python -m app.knowledge.ingest --reset
+```
+
+`--reset` deletes and recreates the collection (`QdrantVectorStore.reset_collection()`) before
+ingesting, so the result always exactly matches whatever is currently in `data/knowledge/` - a
+full rebuild, not an incremental sync. This is a deliberately simple tradeoff for six PDFs that
+change rarely: no document-versioning, no diffing of "which documents changed since last time",
+just "empty, then fully re-ingest" when you know the canonical set changed. That full rebuild
+re-embeds every chunk (cheap today with `FakeEmbeddingProvider`; a real cost once Phase 2.7 wires
+up OpenAI embeddings) - a fine cost for six small documents, but the reason this stays a manual
+flag rather than something the command decides to do automatically.
 
 ## RAG / grounded answering
 
@@ -987,6 +1121,15 @@ discarded once it returns - never written to `ConversationStore`, never given a 
       `check_vehicle_availability`, `BusinessServiceClient` - fake implementation only)
 - [x] Provider-agnostic tool calling / agent orchestration foundation (`AgentService`,
       `LLMProvider.generate()`, bounded to exactly one tool-call round)
+- [x] Canonical six-document knowledge base (`data/knowledge/`), replacing the original two PDFs
+- [x] `QdrantVectorStore` - Qdrant as this project's AI knowledge vector store, alongside the
+      existing `InMemoryVectorStore`/`PgVectorStore` (`PgVectorStore` kept, not the intended
+      store going forward)
+- [x] Persistent, explicit, idempotent Qdrant ingestion command (`python -m app.knowledge.ingest`,
+      `--reset` for stale-document rebuilds) - separate from the in-memory-only startup bootstrap
+- [x] Embedding-dimension resolution fixed to derive from the actual configured EmbeddingProvider,
+      not an OpenAI-only assumption (`pgvector` and `qdrant` can no longer be sized incorrectly)
+- [ ] Real OpenAI embeddings wired end-to-end with Qdrant
 - [ ] PostgreSQL-backed conversation persistence
 - [ ] Long-term/semantic conversation memory, summarization, query rewriting for follow-ups
 - [ ] Real NestJS Business API integration (HTTP `BusinessServiceClient`)

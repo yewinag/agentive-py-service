@@ -36,6 +36,7 @@ class PgVectorStore:
         engine: Optional[AsyncEngine] = None,
     ) -> None:
         self._engine = engine or create_async_engine(database_url)
+        self._dimensions = dimensions
         self._metadata = sa.MetaData()
         self._table = sa.Table(
             table_name,
@@ -48,6 +49,15 @@ class PgVectorStore:
             sa.Column("position", sa.Integer, nullable=False),
             sa.Column("embedding", Vector(dimensions), nullable=False),
         )
+
+    @property
+    def dimensions(self) -> int:
+        """The fixed vector width this store's table was created for.
+        Lets a caller (or a test) confirm the store agrees with whatever
+        EmbeddingProvider is about to write to it, without reaching into
+        SQLAlchemy internals.
+        """
+        return self._dimensions
 
     async def create_schema(self) -> None:
         """Creates the pgvector extension and this store's table if they

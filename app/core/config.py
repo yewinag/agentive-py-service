@@ -41,13 +41,25 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
 
     # Selects the VectorStore implementation in app/knowledge/vector_store.py.
-    # One of: "memory", "pgvector".
+    # One of: "memory", "pgvector", "qdrant".
     vector_store_provider: str = "memory"
 
     # Required only when vector_store_provider == "pgvector". No default
     # on purpose, same reasoning as openai_api_key. Expected form:
     # postgresql+asyncpg://user:password@host:5432/dbname
     database_url: Optional[str] = None
+
+    # Used only when vector_store_provider == "qdrant". Unlike
+    # database_url, a plain host:port carries no credentials, so a safe
+    # local-dev default is reasonable (matches docker-compose.yml).
+    qdrant_url: str = "http://localhost:6333"
+
+    # Collection Qdrant stores chunk embeddings under. Vector width is
+    # not separately configured here - both pgvector and Qdrant reuse
+    # the embedding provider's own dimensions (see
+    # vector_store.py:_embedding_dimensions_for), so the two can never
+    # silently drift apart.
+    qdrant_collection: str = "knowledge_chunk_embeddings"
 
     # Default VectorRetriever.retrieve() top_k, overridable per call.
     retrieval_top_k: int = 5
