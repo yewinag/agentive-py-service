@@ -18,6 +18,9 @@ dependencies = [
     "asyncpg>=0.30",
     "pgvector>=0.3",
     "qdrant-client>=1.12",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-qdrant>=0.2",
 ]
 
 [project.optional-dependencies]

@@ -130,6 +130,8 @@ app/
 ├── health/               # Health-check endpoint
 ├── knowledge/            # Document contracts, extraction, chunking, embedding, storage,
 │                         # retrieval, ingestion orchestration, and startup bootstrap
+├── langchain_integration/ # Sole isolation boundary for the langchain/langchain-openai/
+│                         # langchain-qdrant SDKs (Phase 2.7.1: dependency only, no chain yet)
 ├── llm/                  # LLMProvider Protocol, provider-agnostic models, fake/OpenAI implementations
 ├── rag/                  # AnswerGenerator: Retriever + LLMProvider + history -> grounded answer (no tools)
 └── tools/                # Tool/ToolRegistry, BusinessServiceClient, check_vehicle_availability
@@ -1101,6 +1103,55 @@ persisted; the intermediate tool-call/tool-result exchange lives entirely inside
 discarded once it returns - never written to `ConversationStore`, never given a new
 `ConversationMessage` role, exactly as scoped.
 
+## LangChain integration
+
+**Phase 2.7.1 status: dependency and integration boundary only - no behavior change.** Nothing
+described elsewhere in this README changed: `LLMProvider`, `EmbeddingProvider`, `VectorStore`,
+`VectorRetriever`, `IngestionService`, `AnswerGenerator`, and `AgentService` are all exactly as
+Phases 1-2.6 left them, still what `/api/v1/chat` actually runs today.
+
+**Why LangChain is being introduced:** later phases (2.7.2+) plan to build more elaborate
+retrieval/generation chains and, eventually, a LangGraph-based conversation flow (Phase 4). Both
+are large enough, and standard enough problems, that a maintained orchestration library is worth
+depending on rather than hand-rolling - the same reasoning that already justified depending on
+FastAPI, SQLAlchemy, or the OpenAI SDK instead of writing less than those from scratch.
+
+**What LangChain will eventually handle** (not yet - future phases): composing multi-step
+retrieval/generation chains declaratively, and - via LangGraph - the multi-turn booking
+conversation flow (Understand → Search → Show Cars → Select → Collect Info → Confirm → Create
+Booking) sketched in the wider project roadmap.
+
+**What stays custom, indefinitely:** the provider boundaries themselves. `LLMProvider` and
+`EmbeddingProvider` remain this project's own Protocols - LangChain components, when built, will
+be composed *from* `OpenAIProvider`/`OpenAIEmbeddingProvider` or wrap the existing OpenAI SDK
+calls, not replace the Protocol boundary that keeps the rest of the app decoupled from any one
+SDK. `QdrantVectorStore` and the explicit ingestion command (`app/knowledge/ingest.py`) are
+unaffected - Qdrant remains the vector database, populated exactly as Phase 2.6 built it,
+regardless of what eventually queries it. `AgentService`'s bounded tool-calling and
+`ConversationStore` are also unaffected for now. Business logic never moves into LangChain:
+Strapi/PostgreSQL remains the sole source of truth for Cars/Bookings/Payments, and LangChain
+components (when built) call into this project's own abstractions to reach it, the same as
+everything else does.
+
+**Integration boundary chosen:** `app/langchain_integration/` - a new, currently-empty-of-logic
+package (just a docstring establishing its purpose) where LangChain-specific code will live once
+built. Named `langchain_integration`, not `langchain`, so a local package never shadows the real
+`langchain` import anywhere under `app/`. This mirrors every existing SDK boundary in this
+project: the `openai` SDK is isolated to `app/llm/openai_provider.py` and
+`app/knowledge/openai_embedding_provider.py`; `qdrant-client` to
+`app/knowledge/qdrant_vector_store.py`; `pgvector`/SQLAlchemy to `app/knowledge/pgvector_store.py`.
+`langchain`/`langchain-openai`/`langchain-qdrant` are meant to stay isolated to
+`app/langchain_integration/` alone in exactly the same way - nothing elsewhere in `app/` imports
+them.
+
+**Dependencies added:** `langchain`, `langchain-openai`, `langchain-qdrant` (plus their own
+transitive dependencies - notably `langchain-core`, `langsmith`, `tiktoken`). No other LangChain
+package was added; `langgraph` is deferred to Phase 4, when it's actually used.
+`tests/langchain_integration/test_imports.py` verifies all three import cleanly in this project's
+environment (Python 3.9, alongside the existing `openai`/`qdrant-client`/pydantic v2 stack) - it
+constructs a `langchain_core.documents.Document` and checks `ChatOpenAI`/`OpenAIEmbeddings`
+subclass the expected LangChain base classes, but builds no chain and calls no API.
+
 ## Roadmap
 
 - [x] FastAPI foundation
@@ -1130,6 +1181,11 @@ discarded once it returns - never written to `ConversationStore`, never given a 
 - [x] Embedding-dimension resolution fixed to derive from the actual configured EmbeddingProvider,
       not an OpenAI-only assumption (`pgvector` and `qdrant` can no longer be sized incorrectly)
 - [ ] Real OpenAI embeddings wired end-to-end with Qdrant
+- [x] LangChain dependencies added (`langchain`, `langchain-openai`, `langchain-qdrant`) and
+      `app/langchain_integration/` established as their sole isolation boundary - no chain built,
+      no existing behavior changed (Phase 2.7.1)
+- [ ] First real LangChain component (a retrieval/generation chain) built in
+      `app/langchain_integration/`
 - [ ] PostgreSQL-backed conversation persistence
 - [ ] Long-term/semantic conversation memory, summarization, query rewriting for follow-ups
 - [ ] Real NestJS Business API integration (HTTP `BusinessServiceClient`)
