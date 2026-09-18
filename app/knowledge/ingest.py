@@ -47,7 +47,19 @@ async def run(settings: Settings, reset: bool) -> int:
         print("Status: SUCCESS")
         return 0
 
-    vector_store = get_vector_store(settings)
+    try:
+        vector_store = get_vector_store(settings)
+    except RuntimeError as exc:
+        # e.g. EMBEDDING_PROVIDER=openai with no OPENAI_API_KEY set, or
+        # VECTOR_STORE_PROVIDER=pgvector with no DATABASE_URL - a missing
+        # configuration value, not a reachability problem. Caught here,
+        # before any embedding or Qdrant call is attempted, so a missing
+        # OPENAI_API_KEY is reported cleanly rather than surfacing as an
+        # unhandled traceback partway through.
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        print("Status: FAILED")
+        return 1
+
     try:
         if reset:
             print(f"Resetting collection '{settings.qdrant_collection}' (--reset)...")

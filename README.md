@@ -655,6 +655,40 @@ re-embeds every chunk (cheap today with `FakeEmbeddingProvider`; a real cost onc
 up OpenAI embeddings) - a fine cost for six small documents, but the reason this stays a manual
 flag rather than something the command decides to do automatically.
 
+### Using real OpenAI embeddings for production ingestion (Phase 2.7.2)
+
+`EMBEDDING_PROVIDER` selects between `fake` and `openai` completely independently of
+`VECTOR_STORE_PROVIDER` - nothing about Qdrant is special-cased in `app/knowledge/ingest.py`,
+which only ever calls the generic `get_embedding_provider(settings)` composition point, exactly
+like every other consumer. To persist real, semantically meaningful embeddings into Qdrant:
+
+```bash
+docker compose up -d qdrant
+VECTOR_STORE_PROVIDER=qdrant EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... \
+    python -m app.knowledge.ingest --reset
+```
+
+`--reset` is required the first time you switch from `fake` to `openai` (or between different
+OpenAI models with different output widths): the existing collection was created for whichever
+embedding dimension was in use at the time (8 for `FakeEmbeddingProvider`; 1536 for
+`text-embedding-3-small`), and Qdrant rejects vectors of the wrong width for an existing
+collection outright rather than silently reinterpreting them - `--reset` recreates the collection
+at the new, correct size before ingesting. `_embedding_dimensions_for()` resolves that size from
+`get_embedding_provider(settings).dimensions` (the Phase 2.6 fix), so switching
+`EMBEDDING_PROVIDER` alone is enough - no separate dimension setting to update by hand.
+
+`get_embedding_provider(settings)` fails fast and clearly (`RuntimeError`, before any embedding
+or Qdrant call) if `EMBEDDING_PROVIDER=openai` is set without `OPENAI_API_KEY` -
+`app/knowledge/ingest.py` catches this and reports `Configuration error: ...` / `Status: FAILED`
+rather than letting an unhandled exception surface partway through ingestion.
+
+`FakeEmbeddingProvider` remains the default and is untouched - all existing tests, and every
+local/offline workflow that doesn't need semantic retrieval quality, keep working exactly as
+before. Nothing about the `EmbeddingProvider`/`VectorStore` Protocols, `IngestionService`, or the
+ingestion command's structure changed to support this - the existing abstractions already
+supported real embeddings the moment Phase 2.6 fixed dimension resolution; this phase is choosing
+to actually use them for the persistent Qdrant store, not adding new plumbing.
+
 ## RAG / grounded answering
 
 ```
@@ -1180,7 +1214,9 @@ subclass the expected LangChain base classes, but builds no chain and calls no A
       `--reset` for stale-document rebuilds) - separate from the in-memory-only startup bootstrap
 - [x] Embedding-dimension resolution fixed to derive from the actual configured EmbeddingProvider,
       not an OpenAI-only assumption (`pgvector` and `qdrant` can no longer be sized incorrectly)
-- [ ] Real OpenAI embeddings wired end-to-end with Qdrant
+- [ ] Real OpenAI embeddings wired end-to-end with Qdrant - **code/config path confirmed ready
+      (Phase 2.7.2)**, actual ingestion still blocked on an `OPENAI_API_KEY` not being available
+      in this environment; not yet run for real, see Known limitations
 - [x] LangChain dependencies added (`langchain`, `langchain-openai`, `langchain-qdrant`) and
       `app/langchain_integration/` established as their sole isolation boundary - no chain built,
       no existing behavior changed (Phase 2.7.1)
