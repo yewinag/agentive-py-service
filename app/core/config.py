@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # client is deliberately deferred.
     business_service_provider: str = "fake"
 
+    # Selects which RagAnswerer implementation backs ChatService (see
+    # app/chats/service.py:get_rag_answerer). One of: "existing"
+    # (AgentService - retrieval + bounded tool-calling + LLMProvider,
+    # unchanged since Step 15), "langchain" (Phase 2.8:
+    # KnowledgeBaseRetriever + LangChainRagGenerationService). Defaults
+    # to "existing" - the LangChain path is additive and opt-in, not a
+    # replacement, until there's a reason to change the default.
+    rag_provider: str = "existing"
+
 
 @lru_cache
 def get_settings() -> Settings:
