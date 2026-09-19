@@ -84,12 +84,24 @@ class Settings(BaseSettings):
     conversation_history_window: int = 6
 
     # Selects the BusinessServiceClient implementation in
-    # app/tools/business_client.py. Only "fake" is implemented today; kept
-    # as a setting (matching every other swappable boundary) so a real
-    # HTTP client calling the NestJS Business API slots in without
-    # touching any tool. See README's Tools section for why the real
-    # client is deliberately deferred.
+    # app/tools/business_client.py. One of: "fake", "strapi". Defaults to
+    # "fake" so existing behavior is unchanged until this is explicitly
+    # switched on. See README's Tools section / Phase 3.2 notes.
     business_service_provider: str = "fake"
+
+    # Required only when business_service_provider == "strapi". Strapi
+    # (admin/) is the real business backend for Car/Booking/Payment data
+    # (see Phase 3.1's audit) - never touched by this service directly,
+    # only through its authenticated REST API.
+    strapi_url: str = "http://localhost:1337"
+
+    # No default on purpose, same reasoning as openai_api_key: a missing
+    # token must fail loudly rather than silently falling back. Strapi's
+    # Public role permissions for Car/Booking/Payment are intentionally
+    # left disabled (see Phase 3.1's audit) - this service authenticates
+    # with a scoped, read-only API token instead, created manually in
+    # Strapi Admin (Settings > API Tokens). Never log or print this value.
+    strapi_api_token: Optional[str] = None
 
     # Selects which RagAnswerer implementation backs ChatService (see
     # app/chats/service.py:get_rag_answerer). One of: "existing"

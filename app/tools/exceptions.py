@@ -13,10 +13,11 @@ class ToolInputError(ToolError):
 
 
 class BusinessServiceUnavailableError(ToolError):
-    """Raised when the business service (the future NestJS Business API)
-    cannot be reached or fails. Distinct from ToolExecutionError so a
-    caller can tell "the business system is down, maybe retry" from
-    "something else in the tool went wrong."
+    """Raised when the business service (Strapi - see Phase 3.1's audit)
+    cannot be reached or fails, including auth failures (401/403) against
+    it. Distinct from ToolExecutionError so a caller can tell "the
+    business system is down/misconfigured, maybe retry" from "something
+    else in the tool went wrong."
     """
 
 

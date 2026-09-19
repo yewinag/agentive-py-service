@@ -22,6 +22,27 @@ def test_get_business_service_client_rejects_unknown_provider():
         get_business_service_client(settings)
 
 
+def test_get_business_service_client_requires_a_token_for_strapi():
+    settings = Settings(business_service_provider="strapi", strapi_api_token=None)
+
+    with pytest.raises(RuntimeError):
+        get_business_service_client(settings)
+
+
+def test_get_business_service_client_returns_strapi_client_when_configured():
+    from app.tools.strapi_business_client import StrapiBusinessServiceClient
+
+    settings = Settings(
+        business_service_provider="strapi",
+        strapi_url="http://localhost:1337",
+        strapi_api_token="a-token",
+    )
+
+    client = get_business_service_client(settings)
+
+    assert isinstance(client, StrapiBusinessServiceClient)
+
+
 def test_get_tool_registry_returns_a_registry_with_the_availability_tool():
     settings = Settings()
 

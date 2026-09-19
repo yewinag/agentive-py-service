@@ -17,7 +17,7 @@ FastAPI Agentive Service
   ├── Agent / Orchestration           (app/agent)
   ├── Conversation Memory               (app/conversation)
   ├── RAG / Answering                     (app/rag)
-  ├── Tools                                 (app/tools)  →  (future) NestJS Business API
+  ├── Tools                                 (app/tools)  →  Strapi Business API (Phase 3.2)
   ├── LLM Provider                             (app/llm)
   └── Knowledge Pipeline                          (app/knowledge)
 ```
@@ -108,7 +108,10 @@ Seven boundaries, each with a single responsibility:
 - Conversation persistence beyond a single process (no PostgreSQL-backed `ConversationStore`
   yet - see Conversation context section for why)
 - Long-term/semantic conversation memory, summarization, or query rewriting for follow-ups
-- Real NestJS Business API integration (no HTTP `BusinessServiceClient` yet - see Tools section)
+- A live agent/endpoint actually calling the real Strapi backend (`StrapiBusinessServiceClient`
+  exists as of Phase 3.2, selected via `BUSINESS_SERVICE_PROVIDER=strapi`, but nothing wires it
+  into `AgentService` by default, and no Strapi API token has been provisioned yet - a manual
+  Strapi Admin step, see that phase's report and the Tools section below)
 - More than one tool-call round, parallel tool execution, or multiple registered tools beyond
   `check_vehicle_availability`
 - Autonomous planning / multi-agent systems
@@ -890,8 +893,8 @@ CheckVehicleAvailabilityTool
   ↓
 BusinessServiceClient (Protocol)
   ↑
-FakeBusinessServiceClient          (today)
-HTTP client → NestJS Business API  (future, not built)
+FakeBusinessServiceClient          (tests/dev)
+StrapiBusinessServiceClient        (Phase 3.2 - real Strapi REST API)
 ```
 
 **RAG/knowledge base vs. tools - the core distinction this step establishes:**
@@ -899,7 +902,7 @@ HTTP client → NestJS Business API  (future, not built)
 | | Knowledge base (`app/knowledge`, RAG) | Tools (`app/tools`) |
 |---|---|---|
 | Answers | Relatively static knowledge: policies, services, vehicle-use rules, requirements, general pricing *stated in documents* | Dynamic/live business operations: vehicle availability, booking lookup/creation/modification, customer-specific data |
-| Source of truth | The six canonical PDFs, via retrieval | The business system (future: NestJS Business API) |
+| Source of truth | The six canonical PDFs, via retrieval | Strapi + PostgreSQL (see Phase 3.1's audit and Phase 3.2) |
 | Mechanism | Embedding + vector similarity search | Structured, validated function-style calls |
 
 This Python service must never become the owner of rental business data. `app/tools` is
@@ -953,11 +956,18 @@ booking-lookup/creation tool would add its own method here when it's actually ne
 speculatively now. `FakeBusinessServiceClient` is a deterministic test double, not a second
 business database - it holds only whatever fixed vehicle list a test passes in (default: none),
 filtering by date-range containment and category; nothing is ever *written* to it at runtime,
-so there is no pricing, booking, or customer logic to duplicate. The real HTTP client calling
-the NestJS Business API is **not built this step** - nothing in this repository consumes it yet
-(no agent, no endpoint), and building it now would mean guessing at NestJS's request/response
-shapes and auth before there's a concrete contract to build against; `get_business_service_client()`
-already selects by `Settings.business_service_provider`, so adding it later touches no tool.
+so there is no pricing, booking, or customer logic to duplicate. The real HTTP client was
+**not built this step** (Step 14) - nothing in this repository consumed it yet (no agent, no
+endpoint), and building it then would have meant guessing at a business backend's request/
+response shapes and auth before Phase 3.1 audited a concrete one to build against.
+`get_business_service_client()` already selected by `Settings.business_service_provider`, so
+adding it later touched no tool - which is exactly what Phase 3.2 did: `StrapiBusinessServiceClient`
+(`app/tools/strapi_business_client.py`) calls the real Strapi REST API confirmed in Phase 3.1's
+audit (`GET /api/cars?populate=bookings`, filtered/mapped in Python - see that phase's report for
+the full Car/Booking → tool-contract mapping and date-overlap rules in
+`app/tools/availability_rules.py`), selected via `BUSINESS_SERVICE_PROVIDER=strapi` plus
+`STRAPI_URL`/`STRAPI_API_TOKEN`. Not built by Phase 3.2 either: anything actually calling it (no
+agent wiring, no live token provisioned yet).
 
 **Errors** (`app/tools/exceptions.py`) - a small, three-member hierarchy under `ToolError`,
 matching exactly what a future agent needs to distinguish: `ToolInputError` (raw input failed
@@ -1224,7 +1234,9 @@ subclass the expected LangChain base classes, but builds no chain and calls no A
       `app/langchain_integration/`
 - [ ] PostgreSQL-backed conversation persistence
 - [ ] Long-term/semantic conversation memory, summarization, query rewriting for follow-ups
-- [ ] Real NestJS Business API integration (HTTP `BusinessServiceClient`)
+- [x] Real Strapi Business API integration (`StrapiBusinessServiceClient`, Phase 3.2) - not yet
+      wired into an agent/endpoint, and no Strapi API token has been provisioned yet (a manual
+      Strapi Admin step - see that phase's report)
 - [ ] More than one tool-call round, parallel tool execution, additional tools beyond
       `check_vehicle_availability`
 - [ ] Autonomous planning / multi-agent systems
@@ -1253,7 +1265,7 @@ subclass the expected LangChain base classes, but builds no chain and calls no A
   business operations, owned by the business backend) share no model, table, or store.
 - **Integration boundaries aren't business-domain owners** — `app/tools` describes and invokes
   business operations; it holds no rental inventory, booking state, customer records,
-  authentication, or pricing rules. That data stays owned by the (future) NestJS Business API.
+  authentication, or pricing rules. That data stays owned by the Strapi Business API.
 - **Testability** — every provider boundary has a fake/mocked counterpart so the full test
   suite runs with no network access and no API keys.
 - **No leaking internal failures to the client** — provider/storage exceptions are already
